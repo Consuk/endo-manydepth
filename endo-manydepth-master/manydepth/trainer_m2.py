@@ -24,7 +24,7 @@ from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
 import wandb
 import math
 
-wandb.init(project="IISfMLearner-ENDOVIS", entity="respinosa")
+# wandb.init(project="IISfMLearner-ENDOVIS")
 
 import json
 
