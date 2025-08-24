@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 #from tensorboardX import SummaryWriter
 import wandb
 
-wandb.init(project="MySfMLearner2", entity="respinosa")
+wandb.init(project="MySfMLearner2")
 
 
 import json

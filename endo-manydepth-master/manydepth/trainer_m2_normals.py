@@ -24,7 +24,7 @@ import cv2
 import wandb
 
 
-wandb.init(project="MySfMLNormal", entity="respinosa")
+wandb.init(project="MySfMLNormal")
 
 
 import json

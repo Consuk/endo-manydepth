@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 
 #import wandb
 
-#wandb.init(project="iilDepth-Testing", entity="respinosa")
+#wandb.init(project="iilDepth-Testing")
 
 _DEPTH_COLORMAP = plt.get_cmap('plasma', 256)  # for plotting
 
