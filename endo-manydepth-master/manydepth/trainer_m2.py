@@ -202,6 +202,17 @@ class Trainer_Monodepth:
             len(train_dataset), len(val_dataset)))
 
         self.save_opts()
+        # --- W&B init seguro (una vez) ---
+        self.wandb_enabled = os.getenv("WANDB_DISABLED", "").lower() not in ("true", "1", "yes")
+        if self.wandb_enabled and getattr(wandb, "run", None) is None:
+            wandb.init(
+                project=os.getenv("WANDB_PROJECT", "ManyDepth"),
+                name=self.opt.model_name,
+                config=vars(self.opt),
+                mode=os.getenv("WANDB_MODE", "offline")  # usa "online" si quieres sincronizar
+            )
+        # ----------------------------------
+
 
     def set_train(self):
         """Convert all models to training mode
@@ -619,27 +630,36 @@ class Trainer_Monodepth:
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
     def log(self, mode, inputs, outputs, losses):
-        """Write an event to the tensorboard events file
-        """
-        #writer = self.writers[mode]
+        # Si W&B está desactivado o no hay run, no loguear
+        if not getattr(self, "wandb_enabled", True) or getattr(wandb, "run", None) is None:
+            return
+
         for l, v in losses.items():
-            wandb.log({mode+"{}".format(l):v},step =self.step)
+            wandb.log({mode + "{}".format(l): v}, step=self.step)
 
-        for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
-            s = 0  # log only max scale
+        for j in range(min(4, self.opt.batch_size)):
+            s = 0
             for frame_id in self.opt.frame_ids:
-
-                wandb.log({ "color_{}_{}/{}".format(frame_id, s, j): wandb.Image(inputs[("color", frame_id, s)][j].data)},step=self.step)
-                
+                wandb.log(
+                    {"color_{}_{}/{}".format(frame_id, s, j):
+                    wandb.Image(inputs[("color", frame_id, s)][j].data)},
+                    step=self.step
+                )
                 if s == 0 and frame_id != 0:
-                    wandb.log({"color_pred_{}_{}/{}".format(frame_id, s, j): wandb.Image(outputs[("color", frame_id, s)][j].data)},step=self.step)
-                    wandb.log({"color_pred_refined_{}_{}/{}".format(frame_id, s, j): wandb.Image(outputs[("color_refined", frame_id,s)][j].data)},step=self.step)
-                    wandb.log({"contrast_{}_{}/{}".format(frame_id, s, j): wandb.Image(outputs[("ch",s, frame_id)][j].data)},step=self.step)
-                    wandb.log({"brightness_{}_{}/{}".format(frame_id, s, j): wandb.Image(outputs[("bh",s, frame_id)][j].data)},step=self.step)
-            disp = self.colormap(outputs[("disp", s)][j, 0])
-            wandb.log({"disp_multi_{}/{}".format(s, j): wandb.Image(disp.transpose(1, 2, 0))},step=self.step)
+                    wandb.log({"color_pred_{}_{}/{}".format(frame_id, s, j):
+                            wandb.Image(outputs[("color", frame_id, s)][j].data)}, step=self.step)
+                    wandb.log({"color_pred_refined_{}_{}/{}".format(frame_id, s, j):
+                            wandb.Image(outputs[("color_refined", frame_id, s)][j].data)}, step=self.step)
+                    wandb.log({"contrast_{}_{}/{}".format(frame_id, s, j):
+                            wandb.Image(outputs[("ch", s, frame_id)][j].data)}, step=self.step)
+                    wandb.log({"brightness_{}_{}/{}".format(frame_id, s, j):
+                            wandb.Image(outputs[("bh", s, frame_id)][j].data)}, step=self.step)
 
-           
+            disp = self.colormap(outputs[("disp", s)][j, 0])
+            wandb.log({"disp_multi_{}/{}".format(s, j): wandb.Image(disp.transpose(1, 2, 0))},
+                    step=self.step)
+
+            
                   
 
     def save_opts(self):
