@@ -654,23 +654,34 @@ class Trainer_Monodepth:
         for j in range(min(4, self.opt.batch_size)):
             s = 0
             for frame_id in self.opt.frame_ids:
-                wandb.log({**base,
-                        "color_{}_{}/{}".format(frame_id, s, j): wandb.Image(
-                            inputs[("color", frame_id, s)][j].data)}, step=self.step)
+                wandb.log({
+                    **base,
+                    "color_{}_{}/{}".format(frame_id, s, j):
+                        wandb.Image(inputs[("color", frame_id, s)][j].detach().cpu())
+                }, step=self.step)
+
                 if s == 0 and frame_id != 0:
-                    wandb.log({**base, "color_pred_{}_{}/{}".format(frame_id, s, j):
-                            wandb.Image(outputs[("color", frame_id, s)][j].data)}, step=self.step)
-                    wandb.log({**base, "color_pred_refined_{}_{}/{}".format(frame_id, s, j):
-                            wandb.Image(outputs[("color_refined", frame_id, s)][j].data)}, step=self.step)
-                    wandb.log({**base, "contrast_{}_{}/{}".format(frame_id, s, j):
-                            wandb.Image(outputs[("ch", s, frame_id)][j].data)}, step=self.step)
-                    wandb.log({**base, "brightness_{}_{}/{}".format(frame_id, s, j):
-                            wandb.Image(outputs[("bh", s, frame_id)][j].data)}, step=self.step)
+                    wandb.log({
+                        **base, "color_pred_{}_{}/{}".format(frame_id, s, j):
+                            wandb.Image(outputs[("color", frame_id, s)][j].detach().cpu())
+                    }, step=self.step)
+                    wandb.log({
+                        **base, "color_pred_refined_{}_{}/{}".format(frame_id, s, j):
+                            wandb.Image(outputs[("color_refined", frame_id, s)][j].detach().cpu())
+                    }, step=self.step)
+                    wandb.log({
+                        **base, "contrast_{}_{}/{}".format(frame_id, s, j):
+                            wandb.Image(outputs[("ch", s, frame_id)][j].detach().cpu())
+                    }, step=self.step)
+                    wandb.log({
+                        **base, "brightness_{}_{}/{}".format(frame_id, s, j):
+                            wandb.Image(outputs[("bh", s, frame_id)][j].detach().cpu())
+                    }, step=self.step)
 
+            # 'disp' ya lo conviertes a numpy con self.colormap, así está bien
             disp = self.colormap(outputs[("disp", s)][j, 0])
-            wandb.log({**base, "disp_multi_{}/{}".format(s, j): wandb.Image(disp.transpose(1, 2, 0))},
-                    step=self.step)
-
+            wandb.log({**base, "disp_multi_{}/{}".format(s, j):
+                    wandb.Image(disp.transpose(1, 2, 0))}, step=self.step)
 
             
                   
