@@ -205,25 +205,18 @@ class Trainer_Monodepth:
 
         self.save_opts()
 
-        # --- W&B init (run nuevo y online) ---
-        self.wandb_enabled = os.getenv("WANDB_DISABLED", "").lower() not in ("true","1","yes")
+        self.wandb_enabled = os.getenv("WANDB_DISABLED","").lower() not in ("true","1","yes")
         if self.wandb_enabled and getattr(wandb, "run", None) is None:
-            run_id = os.getenv("WANDB_RUN_ID", uuid.uuid4().hex[:8])  # run nuevo cada vez (si no defines uno)
             wandb.init(
-                project=os.getenv("WANDB_PROJECT", "ManyDepth"),
-                entity=os.getenv("WANDB_ENTITY", None),   # si usas equipo, ponlo en el env
+                project=os.getenv("WANDB_PROJECT","ManyDepth"),
+                entity=os.getenv("WANDB_ENTITY", None),
                 name=self.opt.model_name,
                 config=vars(self.opt),
-                id=run_id,
-                resume="never",            # evita el error de “step menor al actual”
-                mode=os.getenv("WANDB_MODE", "online"),
-                settings=wandb.Settings(start_method="thread"),  # estable en contenedores
+                mode=os.getenv("WANDB_MODE","online"),
+                resume="never",
             )
-            # Opcional: ejes bonitos por step global
-            wandb.define_metric("global_step")
-            wandb.define_metric("train*", step_metric="global_step")
-            wandb.define_metric("val*",   step_metric="global_step")
-        # --------------------------------------
+            print("W&B run URL:", wandb.run.url)   # ← Esto debe salir en tu consola
+
 
 
 
