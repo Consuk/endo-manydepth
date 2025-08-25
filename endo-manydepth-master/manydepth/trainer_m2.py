@@ -202,16 +202,28 @@ class Trainer_Monodepth:
             len(train_dataset), len(val_dataset)))
 
         self.save_opts()
-        # --- W&B init seguro (una vez) ---
-        self.wandb_enabled = os.getenv("WANDB_DISABLED", "").lower() not in ("true", "1", "yes")
+        import uuid, os, wandb
+
+        # --- W&B init (run nuevo y online) ---
+        self.wandb_enabled = os.getenv("WANDB_DISABLED", "").lower() not in ("true","1","yes")
         if self.wandb_enabled and getattr(wandb, "run", None) is None:
+            run_id = os.getenv("WANDB_RUN_ID", uuid.uuid4().hex[:8])  # run nuevo cada vez (si no defines uno)
             wandb.init(
                 project=os.getenv("WANDB_PROJECT", "ManyDepth"),
+                entity=os.getenv("WANDB_ENTITY", None),   # si usas equipo, ponlo en el env
                 name=self.opt.model_name,
                 config=vars(self.opt),
-                mode=os.getenv("WANDB_MODE", "offline")  # usa "online" si quieres sincronizar
+                id=run_id,
+                resume="never",            # evita el error de “step menor al actual”
+                mode=os.getenv("WANDB_MODE", "online"),
+                settings=wandb.Settings(start_method="thread"),  # estable en contenedores
             )
-        # ----------------------------------
+            # Opcional: ejes bonitos por step global
+            wandb.define_metric("global_step")
+            wandb.define_metric("train*", step_metric="global_step")
+            wandb.define_metric("val*",   step_metric="global_step")
+        # --------------------------------------
+
 
 
     def set_train(self):
@@ -630,34 +642,34 @@ class Trainer_Monodepth:
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
     def log(self, mode, inputs, outputs, losses):
-        # Si W&B está desactivado o no hay run, no loguear
         if not getattr(self, "wandb_enabled", True) or getattr(wandb, "run", None) is None:
             return
 
+        base = {"global_step": self.step}
+
         for l, v in losses.items():
-            wandb.log({mode + "{}".format(l): v}, step=self.step)
+            wandb.log({**base, mode + "{}".format(l): v}, step=self.step)
 
         for j in range(min(4, self.opt.batch_size)):
             s = 0
             for frame_id in self.opt.frame_ids:
-                wandb.log(
-                    {"color_{}_{}/{}".format(frame_id, s, j):
-                    wandb.Image(inputs[("color", frame_id, s)][j].data)},
-                    step=self.step
-                )
+                wandb.log({**base,
+                        "color_{}_{}/{}".format(frame_id, s, j): wandb.Image(
+                            inputs[("color", frame_id, s)][j].data)}, step=self.step)
                 if s == 0 and frame_id != 0:
-                    wandb.log({"color_pred_{}_{}/{}".format(frame_id, s, j):
+                    wandb.log({**base, "color_pred_{}_{}/{}".format(frame_id, s, j):
                             wandb.Image(outputs[("color", frame_id, s)][j].data)}, step=self.step)
-                    wandb.log({"color_pred_refined_{}_{}/{}".format(frame_id, s, j):
+                    wandb.log({**base, "color_pred_refined_{}_{}/{}".format(frame_id, s, j):
                             wandb.Image(outputs[("color_refined", frame_id, s)][j].data)}, step=self.step)
-                    wandb.log({"contrast_{}_{}/{}".format(frame_id, s, j):
+                    wandb.log({**base, "contrast_{}_{}/{}".format(frame_id, s, j):
                             wandb.Image(outputs[("ch", s, frame_id)][j].data)}, step=self.step)
-                    wandb.log({"brightness_{}_{}/{}".format(frame_id, s, j):
+                    wandb.log({**base, "brightness_{}_{}/{}".format(frame_id, s, j):
                             wandb.Image(outputs[("bh", s, frame_id)][j].data)}, step=self.step)
 
             disp = self.colormap(outputs[("disp", s)][j, 0])
-            wandb.log({"disp_multi_{}/{}".format(s, j): wandb.Image(disp.transpose(1, 2, 0))},
+            wandb.log({**base, "disp_multi_{}/{}".format(s, j): wandb.Image(disp.transpose(1, 2, 0))},
                     step=self.step)
+
 
             
                   
