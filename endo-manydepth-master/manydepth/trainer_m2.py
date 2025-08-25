@@ -22,6 +22,8 @@ from torch.utils.data import DataLoader
 from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
 #from tensorboardX import SummaryWriter
 import wandb
+import uuid, os
+
 import math
 
 # wandb.init(project="IISfMLearner-ENDOVIS")
@@ -202,7 +204,6 @@ class Trainer_Monodepth:
             len(train_dataset), len(val_dataset)))
 
         self.save_opts()
-        import uuid, os, wandb
 
         # --- W&B init (run nuevo y online) ---
         self.wandb_enabled = os.getenv("WANDB_DISABLED", "").lower() not in ("true","1","yes")
