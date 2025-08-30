@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 
 import wandb
 
-wandb.init(project="iilDepth-Testing")
+wandb.init(project="iilDepth-Testing-ManyDepth")
 
 _DEPTH_COLORMAP = plt.get_cmap('plasma', 256)  # for plotting
 
