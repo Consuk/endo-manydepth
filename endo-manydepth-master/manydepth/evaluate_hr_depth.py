@@ -161,6 +161,14 @@ def evaluate(opt):
                 pred_disps.append(pred_disp)
 
         pred_disps = np.concatenate(pred_disps)
+        # --- Colapsar post-proc (Monodepth v1) de 2N -> N ---
+        if opt.post_process:
+            N = pred_disps.shape[0] // 2
+            pred_disps = batch_post_process_disparity(
+                pred_disps[:N],                   # disparidades originales
+                pred_disps[N:, :, ::-1]           # disparidades de las imágenes volteadas (desvolteadas aquí)
+            )
+
 
     else:
         # ------- Cargar predicciones desde archivo -------
