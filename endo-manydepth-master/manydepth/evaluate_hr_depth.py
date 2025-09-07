@@ -93,54 +93,66 @@ def evaluate(opt):
         filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
         encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
         decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
-
-        # ------- Dataset / Dataloader -------
-        HEIGHT, WIDTH = 256, 320
-        img_ext = '.png' if opt.png else '.jpg'
-        dataset = datasets.SCAREDRAWDataset(
-            opt.data_path, filenames, HEIGHT, WIDTH, [0], 4, is_train=False, img_ext=img_ext
-        )
-        dataloader = DataLoader(
-            dataset, 8, shuffle=False, num_workers=opt.num_workers, pin_memory=True, drop_last=False
-        )
-
-        # ------- Build encoder (ResNet) & robust load -------
-        encoder = networks.ResnetEncoder(opt.num_layers, False)
-
-        import torch
-        ckpt_enc = torch.load(encoder_path, map_location="cpu")
-
-        # Desanidar si venía dentro de 'model'/'state_dict'/etc.
-        sd = ckpt_enc
-        for k in ("model", "state_dict", "encoder_state_dict", "net", "weights"):
-            if isinstance(sd, dict) and k in sd and isinstance(sd[k], dict):
-                sd = sd[k]
-                break
-
-        # Quitar 'module.' si fue guardado con DataParallel
-        sd = {k.replace("module.", ""): v for k, v in sd.items()}
-
-        # Prefijo esperado por ResnetEncoder: 'encoder.'
-        if sd and not next(iter(sd)).startswith("encoder."):
-            sd = {f"encoder.{k}": v for k, v in sd.items()}
-
-        # Filtrar a llaves presentes en el modelo y cargar con strict=False
-        model_dict = encoder.state_dict()
-        sd = {k: v for k, v in sd.items() if k in model_dict}
-        missing, unexpected = encoder.load_state_dict(sd, strict=False)
-        print(f"[encoder] missing: {len(missing)} unexpected: {len(unexpected)}")
-
-        # ------- Build depth decoder & robust load -------
         ckpt_dec = torch.load(decoder_path, map_location="cpu")
-        if isinstance(ckpt_dec, dict):
-            for k in ("model", "state_dict", "decoder_state_dict", "net", "weights"):
-                if k in ckpt_dec and isinstance(ckpt_dec[k], dict):
-                    ckpt_dec = ckpt_dec[k]
-                    break
-        depth_decoder = networks.DepthDecoderT()
-        _ = depth_decoder.load_state_dict(ckpt_dec, strict=False)
 
-        encoder.cuda(); encoder.eval()
+        # Desanidar si viene bajo 'model'/'state_dict'/etc.
+        sd_dec = ckpt_dec
+        if isinstance(sd_dec, dict):
+            for k in ("model", "state_dict", "decoder_state_dict", "net", "weights"):
+                if k in sd_dec and isinstance(sd_dec[k], dict):
+                    sd_dec = sd_dec[k]
+                    break
+
+        # Quitar 'module.' si fue DataParallel
+        sd_dec = {k.replace("module.", ""): v for k, v in sd_dec.items()}
+
+        # Asegurar prefijo 'decoder.' si falta
+        if len(sd_dec) and not next(iter(sd_dec)).startswith("decoder."):
+            sd_dec = {f"decoder.{k}": v for k, v in sd_dec.items()}
+
+        def try_build_and_score(build_fn):
+            """Instancia un decoder con build_fn(), y mide cuántas llaves del ckpt
+            coinciden en NOMBRE y SHAPE con el modelo actual."""
+            try:
+                dec = build_fn()
+            except Exception:
+                return None, 0, {}
+            model_dict = dec.state_dict()
+            filtered = {}
+            score = 0
+            for k, v in sd_dec.items():
+                if k in model_dict and tuple(model_dict[k].shape) == tuple(v.shape):
+                    filtered[k] = v
+                    score += 1
+            return dec, score, filtered
+
+        # Intentar con DepthDecoderT y con DepthDecoder; elegir el que mejor encaja
+        candidates = []
+
+        # 1) DepthDecoderT (si existe)
+        if hasattr(networks, "DepthDecoderT"):
+            dec_t, score_t, filt_t = try_build_and_score(lambda: networks.DepthDecoderT())
+            if dec_t is not None:
+                candidates.append(("DepthDecoderT", dec_t, score_t, filt_t))
+
+        # 2) DepthDecoder clásico (si existe)
+        if hasattr(networks, "DepthDecoder"):
+            # Nota: DepthDecoder clásico suele requerir encoder.num_ch_enc
+            dec_d, score_d, filt_d = try_build_and_score(lambda: networks.DepthDecoder(encoder.num_ch_enc))
+            if dec_d is not None:
+                candidates.append(("DepthDecoder", dec_d, score_d, filt_d))
+
+        assert len(candidates) > 0, "No pude instanciar ningún decoder (ni DepthDecoderT ni DepthDecoder)."
+
+        name, depth_decoder, best_score, best_filtered = max(candidates, key=lambda x: x[2])
+
+        total_params = len(depth_decoder.state_dict())
+        print(f"[decoder] elegido: {name} | llaves compatibles: {best_score}/{total_params}")
+
+        # Cargar sólo las llaves compatibles; el resto queda inicializado por defecto
+        missing, unexpected = depth_decoder.load_state_dict(best_filtered, strict=False)
+        print(f"[decoder] missing: {len(missing)} unexpected: {len(unexpected)}")
+
         depth_decoder.cuda(); depth_decoder.eval()
 
         pred_disps = []
