@@ -95,15 +95,17 @@ def evaluate(opt):
         decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
 
         # ------- Dataset / Dataloader -------
-        HEIGHT, WIDTH = 256, 320
+        # ------- Dataset / Dataloader -------
+        HEIGHT, WIDTH = opt.height, opt.width
         img_ext = '.png' if opt.png else '.jpg'
         dataset = datasets.SCAREDRAWDataset(
             opt.data_path, filenames, HEIGHT, WIDTH, [0], 4, is_train=False, img_ext=img_ext
         )
         dataloader = DataLoader(
-            dataset, 8, shuffle=False, num_workers=opt.num_workers,
+            dataset, opt.batch_size, shuffle=False, num_workers=opt.num_workers,
             pin_memory=True, drop_last=False
         )
+
 
         # ------- Encoder (ResNet) & carga robusta -------
         encoder = networks.ResnetEncoder(opt.num_layers, False)
