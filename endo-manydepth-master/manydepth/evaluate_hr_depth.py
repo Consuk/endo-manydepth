@@ -93,73 +93,99 @@ def evaluate(opt):
         filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
         encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
         decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
-        ckpt_dec = torch.load(decoder_path, map_location="cpu")
 
-        # Desanidar si viene bajo 'model'/'state_dict'/etc.
+        # ------- Dataset / Dataloader -------
+        HEIGHT, WIDTH = 256, 320
+        img_ext = '.png' if opt.png else '.jpg'
+        dataset = datasets.SCAREDRAWDataset(
+            opt.data_path, filenames, HEIGHT, WIDTH, [0], 4, is_train=False, img_ext=img_ext
+        )
+        dataloader = DataLoader(
+            dataset, 8, shuffle=False, num_workers=opt.num_workers,
+            pin_memory=True, drop_last=False
+        )
+
+        # ------- Encoder (ResNet) & carga robusta -------
+        encoder = networks.ResnetEncoder(opt.num_layers, False)
+
+        ckpt_enc = torch.load(encoder_path, map_location="cpu")
+        # desanidar si venía dentro de 'model'/'state_dict'/etc.
+        sd_enc = ckpt_enc
+        for k in ("model", "state_dict", "encoder_state_dict", "net", "weights"):
+            if isinstance(sd_enc, dict) and k in sd_enc and isinstance(sd_enc[k], dict):
+                sd_enc = sd_enc[k]
+                break
+        # quitar 'module.' si fue DataParallel
+        sd_enc = {k.replace("module.", ""): v for k, v in sd_enc.items()}
+        # prefijo esperado por ResnetEncoder: 'encoder.'
+        if sd_enc and not next(iter(sd_enc)).startswith("encoder."):
+            sd_enc = {f"encoder.{k}": v for k, v in sd_enc.items()}
+        # filtrar a llaves presentes en el modelo y cargar con strict=False
+        model_dict = encoder.state_dict()
+        sd_enc = {k: v for k, v in sd_enc.items() if k in model_dict}
+        missing, unexpected = encoder.load_state_dict(sd_enc, strict=False)
+        print(f"[encoder] missing: {len(missing)} unexpected: {len(unexpected)}")
+
+        # ------- Decoder & carga robusta -------
+        ckpt_dec = torch.load(decoder_path, map_location="cpu")
         sd_dec = ckpt_dec
         if isinstance(sd_dec, dict):
             for k in ("model", "state_dict", "decoder_state_dict", "net", "weights"):
                 if k in sd_dec and isinstance(sd_dec[k], dict):
                     sd_dec = sd_dec[k]
                     break
-
-        # Quitar 'module.' si fue DataParallel
         sd_dec = {k.replace("module.", ""): v for k, v in sd_dec.items()}
 
-        # Asegurar prefijo 'decoder.' si falta
-        if len(sd_dec) and not next(iter(sd_dec)).startswith("decoder."):
-            sd_dec = {f"decoder.{k}": v for k, v in sd_dec.items()}
-
-        def try_build_and_score(build_fn):
-            """Instancia un decoder con build_fn(), y mide cuántas llaves del ckpt
-            coinciden en NOMBRE y SHAPE con el modelo actual."""
+        def try_build_and_score(name, build_fn, add_prefix=None):
+            """Instancia un decoder y cuenta cuántas llaves coinciden en nombre y SHAPE."""
             try:
                 dec = build_fn()
             except Exception:
                 return None, 0, {}
             model_dict = dec.state_dict()
-            filtered = {}
-            score = 0
+            filtered, score = {}, 0
             for k, v in sd_dec.items():
-                if k in model_dict and tuple(model_dict[k].shape) == tuple(v.shape):
-                    filtered[k] = v
+                kk = f"{add_prefix}{k}" if (add_prefix and not k.startswith(add_prefix)) else k
+                if kk in model_dict and tuple(model_dict[kk].shape) == tuple(v.shape):
+                    filtered[kk] = v
                     score += 1
             return dec, score, filtered
 
-        # Intentar con DepthDecoderT y con DepthDecoder; elegir el que mejor encaja
         candidates = []
-
-        # 1) DepthDecoderT (si existe)
         if hasattr(networks, "DepthDecoderT"):
-            dec_t, score_t, filt_t = try_build_and_score(lambda: networks.DepthDecoderT())
-            if dec_t is not None:
-                candidates.append(("DepthDecoderT", dec_t, score_t, filt_t))
-
-        # 2) DepthDecoder clásico (si existe)
+            d_t, s_t, f_t = try_build_and_score("DepthDecoderT",
+                                                lambda: networks.DepthDecoderT(),
+                                                add_prefix="decoder.")
+            if d_t is not None:
+                candidates.append(("DepthDecoderT", d_t, s_t, f_t))
         if hasattr(networks, "DepthDecoder"):
-            # Nota: DepthDecoder clásico suele requerir encoder.num_ch_enc
-            dec_d, score_d, filt_d = try_build_and_score(lambda: networks.DepthDecoder(encoder.num_ch_enc))
-            if dec_d is not None:
-                candidates.append(("DepthDecoder", dec_d, score_d, filt_d))
-
+            d_d, s_d, f_d = try_build_and_score("DepthDecoder",
+                                                lambda: networks.DepthDecoder(encoder.num_ch_enc),
+                                                add_prefix="decoder.")
+            if d_d is not None:
+                candidates.append(("DepthDecoder", d_d, s_d, f_d))
         assert len(candidates) > 0, "No pude instanciar ningún decoder (ni DepthDecoderT ni DepthDecoder)."
 
         name, depth_decoder, best_score, best_filtered = max(candidates, key=lambda x: x[2])
-
         total_params = len(depth_decoder.state_dict())
         print(f"[decoder] elegido: {name} | llaves compatibles: {best_score}/{total_params}")
 
-        # Cargar sólo las llaves compatibles; el resto queda inicializado por defecto
-        missing, unexpected = depth_decoder.load_state_dict(best_filtered, strict=False)
-        print(f"[decoder] missing: {len(missing)} unexpected: {len(unexpected)}")
+        # Si el encaje es decente, cargamos; si no, seguimos con init por defecto
+        ratio = best_score / max(total_params, 1)
+        if ratio > 0.6:
+            missing, unexpected = depth_decoder.load_state_dict(best_filtered, strict=False)
+            print(f"[decoder] missing: {len(missing)} unexpected: {len(unexpected)}")
+        else:
+            print("[decoder] Advertencia: checkpoint incompatible; se usa init por defecto.")
 
+        # ------- mover a GPU / eval -------
+        encoder.cuda(); encoder.eval()
         depth_decoder.cuda(); depth_decoder.eval()
 
         pred_disps = []
-
-        # Meta de alto/ancho si existe en el checkpoint, si no usa HEIGHT/WIDTH
-        wmeta = ckpt_enc['width'] if isinstance(ckpt_enc, dict) and 'width' in ckpt_enc else WIDTH
-        hmeta = ckpt_enc['height'] if isinstance(ckpt_enc, dict) and 'height' in ckpt_enc else HEIGHT
+        # meta de alto/ancho (usa opt o defaults)
+        wmeta = getattr(opt, "width", WIDTH)
+        hmeta = getattr(opt, "height", HEIGHT)
         print("-> Computing predictions with size {}x{}".format(wmeta, hmeta))
 
         with torch.no_grad():
@@ -167,14 +193,14 @@ def evaluate(opt):
                 input_color = data[("color", 0, 0)].cuda()
 
                 if opt.post_process:
-                    # Si usas post-proc, duplica con flip horizontal
+                    # si usas post-proc, duplica con flip horizontal
                     input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
 
                 output = depth_decoder(encoder(input_color))
                 pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
 
-                # (Post-proc tipo Monodepth v1 lo tienes más abajo, si lo quieres reactivar)
+                # (si activas post-proc tipo Monodepth v1, aplícalo aquí)
                 pred_disps.append(pred_disp)
 
         pred_disps = np.concatenate(pred_disps)
@@ -183,7 +209,6 @@ def evaluate(opt):
         # ------- Cargar predicciones desde archivo -------
         print("-> Loading predictions from {}".format(opt.ext_disp_to_eval))
         pred_disps = np.load(opt.ext_disp_to_eval)
-
         if opt.eval_eigen_to_benchmark:
             eigen_to_benchmark_ids = np.load(
                 os.path.join(splits_dir, "benchmark", "eigen_to_benchmark_ids.npy"))
@@ -218,20 +243,20 @@ def evaluate(opt):
         gt_height, gt_width = gt_depth.shape[:2]
         pred_disp = pred_disps[i]
 
-        # Visual opcional: disp coloreado
-        disp = colormap(pred_disp)
+        # opcional: visual de disparidad
+        # disp_vis = colormap(pred_disp)
 
         # Ajustar a tamaño GT y convertir a depth
         pred_disp = cv2.resize(pred_disp, (gt_width, gt_height))
         pred_depth = 1.0 / np.maximum(pred_disp, 1e-12)
 
-        # Máscara válida (estilo KITTI adaptado)
+        # Máscara válida
         mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
 
         pred_depth = pred_depth[mask]
         gt_depth_m = gt_depth[mask]
 
-        # Escalado por mediana si no está deshabilitado
+        # Escalado por mediana (mono)
         if not opt.disable_median_scaling:
             ratio = np.median(gt_depth_m) / np.median(pred_depth)
             ratios.append(ratio)
@@ -251,15 +276,14 @@ def evaluate(opt):
     mean_errors = np.array(errors).mean(0)
 
     # ------- Guardar e imprimir resultados -------
-    results_edit = open('results.txt', mode='a')
-    results_edit.write("\n model_name: %s " % (opt.load_weights_folder))
-    results_edit.write("\n " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
-    results_edit.write("\n " + ("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
-    results_edit.close()
-
+    with open('results.txt', mode='a') as results_edit:
+        results_edit.write("\n model_name: %s " % (opt.load_weights_folder))
+        results_edit.write("\n " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
+        results_edit.write("\n " + ("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
     print("\n  " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
     print(("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
     print("\n-> Done!")
+
 
 
 def colormap(inputs, normalize=True, torch_transpose=True):
