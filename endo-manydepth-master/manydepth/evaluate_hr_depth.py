@@ -109,81 +109,39 @@ def evaluate(opt):
         encoder = networks.ResnetEncoder(opt.num_layers, False)
 
         ckpt_enc = torch.load(encoder_path, map_location="cpu")
-        # desanidar si venía dentro de 'model'/'state_dict'/etc.
         sd_enc = ckpt_enc
         for k in ("model", "state_dict", "encoder_state_dict", "net", "weights"):
             if isinstance(sd_enc, dict) and k in sd_enc and isinstance(sd_enc[k], dict):
                 sd_enc = sd_enc[k]
                 break
-        # quitar 'module.' si fue DataParallel
         sd_enc = {k.replace("module.", ""): v for k, v in sd_enc.items()}
-        # prefijo esperado por ResnetEncoder: 'encoder.'
         if sd_enc and not next(iter(sd_enc)).startswith("encoder."):
             sd_enc = {f"encoder.{k}": v for k, v in sd_enc.items()}
-        # filtrar a llaves presentes en el modelo y cargar con strict=False
         model_dict = encoder.state_dict()
         sd_enc = {k: v for k, v in sd_enc.items() if k in model_dict}
         missing, unexpected = encoder.load_state_dict(sd_enc, strict=False)
         print(f"[encoder] missing: {len(missing)} unexpected: {len(unexpected)}")
 
-        # ------- Decoder & carga robusta -------
+        # ------- Decoder (DepthDecoder clásico) & carga ESTRICTA -------
         ckpt_dec = torch.load(decoder_path, map_location="cpu")
         sd_dec = ckpt_dec
-        if isinstance(sd_dec, dict):
-            for k in ("model", "state_dict", "decoder_state_dict", "net", "weights"):
-                if k in sd_dec and isinstance(sd_dec[k], dict):
-                    sd_dec = sd_dec[k]
-                    break
+        for k in ("model", "state_dict", "decoder_state_dict", "net", "weights"):
+            if isinstance(sd_dec, dict) and k in sd_dec and isinstance(sd_dec[k], dict):
+                sd_dec = sd_dec[k]
+                break
         sd_dec = {k.replace("module.", ""): v for k, v in sd_dec.items()}
+        if len(sd_dec) and not next(iter(sd_dec)).startswith("decoder."):
+            sd_dec = {f"decoder.{k}": v for k, v in sd_dec.items()}
 
-        def try_build_and_score(name, build_fn, add_prefix=None):
-            """Instancia un decoder y cuenta cuántas llaves coinciden en nombre y SHAPE."""
-            try:
-                dec = build_fn()
-            except Exception:
-                return None, 0, {}
-            model_dict = dec.state_dict()
-            filtered, score = {}, 0
-            for k, v in sd_dec.items():
-                kk = f"{add_prefix}{k}" if (add_prefix and not k.startswith(add_prefix)) else k
-                if kk in model_dict and tuple(model_dict[kk].shape) == tuple(v.shape):
-                    filtered[kk] = v
-                    score += 1
-            return dec, score, filtered
-
-        candidates = []
-        if hasattr(networks, "DepthDecoderT"):
-            d_t, s_t, f_t = try_build_and_score("DepthDecoderT",
-                                                lambda: networks.DepthDecoderT(),
-                                                add_prefix="decoder.")
-            if d_t is not None:
-                candidates.append(("DepthDecoderT", d_t, s_t, f_t))
-        if hasattr(networks, "DepthDecoder"):
-            d_d, s_d, f_d = try_build_and_score("DepthDecoder",
-                                                lambda: networks.DepthDecoder(encoder.num_ch_enc),
-                                                add_prefix="decoder.")
-            if d_d is not None:
-                candidates.append(("DepthDecoder", d_d, s_d, f_d))
-        assert len(candidates) > 0, "No pude instanciar ningún decoder (ni DepthDecoderT ni DepthDecoder)."
-
-        name, depth_decoder, best_score, best_filtered = max(candidates, key=lambda x: x[2])
-        total_params = len(depth_decoder.state_dict())
-        print(f"[decoder] elegido: {name} | llaves compatibles: {best_score}/{total_params}")
-
-        # Si el encaje es decente, cargamos; si no, seguimos con init por defecto
-        ratio = best_score / max(total_params, 1)
-        if ratio > 0.6:
-            missing, unexpected = depth_decoder.load_state_dict(best_filtered, strict=False)
-            print(f"[decoder] missing: {len(missing)} unexpected: {len(unexpected)}")
-        else:
-            print("[decoder] Advertencia: checkpoint incompatible; se usa init por defecto.")
+        depth_decoder = networks.DepthDecoder(encoder.num_ch_enc)
+        missing, unexpected = depth_decoder.load_state_dict(sd_dec, strict=True)
+        print(f"[decoder] strict load OK. missing:{len(missing)} unexpected:{len(unexpected)}")
 
         # ------- mover a GPU / eval -------
         encoder.cuda(); encoder.eval()
         depth_decoder.cuda(); depth_decoder.eval()
 
         pred_disps = []
-        # meta de alto/ancho (usa opt o defaults)
         wmeta = getattr(opt, "width", WIDTH)
         hmeta = getattr(opt, "height", HEIGHT)
         print("-> Computing predictions with size {}x{}".format(wmeta, hmeta))
@@ -193,14 +151,11 @@ def evaluate(opt):
                 input_color = data[("color", 0, 0)].cuda()
 
                 if opt.post_process:
-                    # si usas post-proc, duplica con flip horizontal
                     input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
 
                 output = depth_decoder(encoder(input_color))
                 pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
-
-                # (si activas post-proc tipo Monodepth v1, aplícalo aquí)
                 pred_disps.append(pred_disp)
 
         pred_disps = np.concatenate(pred_disps)
@@ -243,26 +198,19 @@ def evaluate(opt):
         gt_height, gt_width = gt_depth.shape[:2]
         pred_disp = pred_disps[i]
 
-        # opcional: visual de disparidad
-        # disp_vis = colormap(pred_disp)
-
-        # Ajustar a tamaño GT y convertir a depth
         pred_disp = cv2.resize(pred_disp, (gt_width, gt_height))
         pred_depth = 1.0 / np.maximum(pred_disp, 1e-12)
 
-        # Máscara válida
         mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
 
         pred_depth = pred_depth[mask]
         gt_depth_m = gt_depth[mask]
 
-        # Escalado por mediana (mono)
         if not opt.disable_median_scaling:
             ratio = np.median(gt_depth_m) / np.median(pred_depth)
             ratios.append(ratio)
             pred_depth *= ratio
 
-        # Clamp de safety
         pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
 
