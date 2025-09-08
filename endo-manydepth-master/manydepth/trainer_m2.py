@@ -19,9 +19,18 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure
-#from tensorboardX import SummaryWriter
-import wandb
+# IMPORTS SEGUROS (no rompen si no están instalados)
+try:
+    from torchmetrics.image import MultiScaleStructuralSimilarityIndexMeasure  # opcional
+    _HAS_TM = True
+except Exception:
+    _HAS_TM = False
+
+try:
+    import wandb  # opcional
+except Exception:
+    wandb = None
+
 import uuid, os
 
 import math
@@ -71,32 +80,25 @@ class Trainer_Monodepth:
         if self.opt.use_stereo:
             self.opt.frame_ids.append("s")
         
-        
-        # --- ENCODER + DEPTH DECODER ---
-        backbone = getattr(self.opt, "backbone", "resnet")
-
-        if backbone == "mpvit":
-            # Si quieres desde cero: deja mpvit_ckpt = None (o weights_init != "pretrained")
-            mpvit_ckpt = getattr(self.opt, "mpvit_ckpt", "")
-            mpvit_ckpt = mpvit_ckpt if (self.opt.weights_init == "pretrained" and mpvit_ckpt) else None
-
-            # Encoder MPViT (tu mpvit_small ya acepta pretrained_ckpt=None)
-            self.models["encoder"] = networks.mpvit_small(pretrained_ckpt=mpvit_ckpt)
-            # Expón los canales para el decoder
+        # ----------------- ENCODER / DECODER -----------------
+        if getattr(self.opt, "backbone", "resnet") == "mpvit":
+            # MPViT
+            self.models["encoder"] = networks.mpvit_small(
+                use_pretrained=bool(getattr(self.opt, "mpvit_ckpt", "")),
+                weights=getattr(self.opt, "mpvit_ckpt", "")
+            )
+            # Canales de MPViT small
             self.models["encoder"].num_ch_enc = [64, 64, 128, 216, 288]
             self.models["encoder"].to(self.device)
             self.parameters_to_train += list(self.models["encoder"].parameters())
 
-            # Decoder: preferir el T si existe; si no, caer al clásico
-            if hasattr(networks, "DepthDecoderT"):
-                self.models["depth"] = networks.DepthDecoderT()
-            else:
-                self.models["depth"] = networks.DepthDecoder(self.models["encoder"].num_ch_enc, self.opt.scales)
+            # Decoder tipo transformer
+            self.models["depth"] = networks.DepthDecoderT()
             self.models["depth"].to(self.device)
             self.parameters_to_train += list(self.models["depth"].parameters())
 
         else:
-            # === ResNet por defecto (lo que ya tenías) ===
+            # ResNet (comportamiento original)
             self.models["encoder"] = networks.ResnetEncoder(
                 self.opt.num_layers, self.opt.weights_init == "pretrained")
             self.models["encoder"].to(self.device)
@@ -106,6 +108,8 @@ class Trainer_Monodepth:
                 self.models["encoder"].num_ch_enc, self.opt.scales)
             self.models["depth"].to(self.device)
             self.parameters_to_train += list(self.models["depth"].parameters())
+        # ------------------------------------------------------
+
 
         if self.use_pose_net:
             if self.opt.pose_model_type == "separate_resnet":
@@ -216,8 +220,8 @@ class Trainer_Monodepth:
 
         self.save_opts()
 
-        self.wandb_enabled = os.getenv("WANDB_DISABLED","").lower() not in ("true","1","yes")
-        if self.wandb_enabled and getattr(wandb, "run", None) is None:
+        self.wandb_enabled = os.getenv("WANDB_DISABLED", "").lower() not in ("true", "1", "yes")
+        if self.wandb_enabled and (wandb is not None) and getattr(wandb, "run", None) is None:
             wandb.init(
                 project=os.getenv("WANDB_PROJECT","ManyDepth"),
                 entity=os.getenv("WANDB_ENTITY", None),
@@ -226,8 +230,7 @@ class Trainer_Monodepth:
                 mode=os.getenv("WANDB_MODE","online"),
                 resume="never",
             )
-            print("W&B run URL:", wandb.run.url)   # ← Esto debe salir en tu consola
-
+            print("W&B run URL:", wandb.run.url)
 
 
 
