@@ -801,18 +801,16 @@ def mpvit_xsmall(**kwargs):
     return model
 
 
-def mpvit_small(**kwargs):
-    """mpvit_small :
-
-    - #paths : [2, 3, 3, 3]
-    - #layers : [1, 3, 6, 3]
-    - #channels : [64, 128, 216, 288]
-    - MLP_ratio : 4
-    Number of params : 22892400
-    FLOPs : 4799650824
-    Activations : 30601880
+def mpvit_small(pretrained_ckpt=None, **kwargs):
     """
+    MPViT-Small
 
+    - #paths   : [2, 3, 3, 3]
+    - #layers  : [1, 3, 6, 3]
+    - #channels: [64, 128, 216, 288]
+    - MLP_ratio: 4
+    """
+    # Instancia el modelo como ya lo hacías
     model = MPViT(
         num_stages=4,
         num_path=[2, 3, 3, 3],
@@ -822,14 +820,44 @@ def mpvit_small(**kwargs):
         num_heads=[8, 8, 8, 8],
         **kwargs,
     )
-    checkpoint = torch.load('/workspace/endo-manydepth/manydepth/mpvit/mpvit_small.pth', map_location=lambda storage, loc: storage)['model']
-    logger = logging.getLogger()
-    
-    
-    load_state_dict(model, checkpoint, strict=False, logger=logger)
-    del checkpoint
-    del logger
-    model.default_cfg = _cfg_mpvit()
+
+    # Config por defecto (si la usabas)
+    if "_cfg_mpvit" in globals():
+        model.default_cfg = _cfg_mpvit()
+
+    logger = logging.getLogger(__name__)
+
+    # ---- CARGA OPCIONAL DE PESOS PREENTRENADOS ----
+    # Si NO pasas 'pretrained_ckpt', se entrena desde cero y NO truena.
+    if pretrained_ckpt:
+        if os.path.isfile(pretrained_ckpt):
+            ckpt = torch.load(pretrained_ckpt, map_location="cpu")
+            # Muchos checkpoints vienen como {'model': state_dict}
+            if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+                ckpt = ckpt["model"]
+
+            # Intenta usar mmcv si está disponible (mismo patrón que tenías)
+            used_mmcv = False
+            try:
+                from mmcv.runner import load_state_dict as mmcv_load_state_dict  # type: ignore
+                mmcv_load_state_dict(model, ckpt, strict=False, logger=logger)
+                used_mmcv = True
+                logger.info(f"[mpvit_small] Loaded pretrained with MMCV from {pretrained_ckpt}")
+            except Exception:
+                pass
+
+            if not used_mmcv:
+                # Fallback: PyTorch puro
+                res = model.load_state_dict(ckpt, strict=False)
+                miss = len(getattr(res, "missing_keys", []))
+                unex = len(getattr(res, "unexpected_keys", []))
+                logger.info(f"[mpvit_small] Loaded pretrained from {pretrained_ckpt} "
+                            f"(missing={miss}, unexpected={unex})")
+        else:
+            logger.warning(f"[mpvit_small] Pretrained ckpt not found: {pretrained_ckpt}. Training from scratch.")
+    else:
+        logger.info("[mpvit_small] Training from scratch (no pretrained ckpt).")
+
     return model
 
 

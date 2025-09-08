@@ -25,6 +25,21 @@ class MonodepthOptions:
                                  default=os.path.join(os.path.expanduser("~"), "tmp"))
 
         # TRAINING options
+        self.parser.add_argument("--backbone",
+                             type=str,
+                             choices=["resnet", "mpvit"],
+                              default="resnet",
+                              help="Encoder backbone a usar")
+        self.parser.add_argument("--mpvit_ckpt",
+                              type=str,
+                              default="",
+                              help="Ruta a mpvit_small.pth (opcional). Si vacío y weights_init='scratch', se entrena desde cero.")
+        self.parser.add_argument("--decoder_type",
+                              type=str,
+                              choices=["auto","depth","depthT"],
+                              default="auto",
+                              help="auto: usa DepthDecoder para resnet y DepthDecoderT para mpvit")
+
         self.parser.add_argument("--model_name",
                                  type=str,
                                  help="the name of the folder to save the model in",

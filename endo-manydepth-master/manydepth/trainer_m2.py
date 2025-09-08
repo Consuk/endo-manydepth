@@ -72,30 +72,41 @@ class Trainer_Monodepth:
             self.opt.frame_ids.append("s")
         
         
-        #Transformer
-        """
-        self.models["encoder"] = networks.mpvit_small()            
-        self.models["encoder"].num_ch_enc = [64,64,128,216,288]
-        self.models["encoder"].to(self.device)
-        self.parameters_to_train += list(self.models["encoder"].parameters())"""
-        #Resnet18 Encoder
-        self.models["encoder"] = networks.ResnetEncoder(
-            self.opt.num_layers, self.opt.weights_init == "pretrained")
-        self.models["encoder"].to(self.device)
-        self.parameters_to_train += list(self.models["encoder"].parameters()) 
-        #Resnet18 Encoder
-        
-        self.models["depth"] = networks.DepthDecoder(
-            self.models["encoder"].num_ch_enc, self.opt.scales)
-        self.models["depth"].to(self.device)
-        self.parameters_to_train += list(self.models["depth"].parameters())
-        
-        #Transformer"
-        """
-        self.models["depth"] = networks.DepthDecoderT()
-        self.models["depth"].to(self.device)
-        self.parameters_to_train += list(self.models["depth"].parameters())
-        """
+        # --- ENCODER + DEPTH DECODER ---
+        backbone = getattr(self.opt, "backbone", "resnet")
+
+        if backbone == "mpvit":
+            # Si quieres desde cero: deja mpvit_ckpt = None (o weights_init != "pretrained")
+            mpvit_ckpt = getattr(self.opt, "mpvit_ckpt", "")
+            mpvit_ckpt = mpvit_ckpt if (self.opt.weights_init == "pretrained" and mpvit_ckpt) else None
+
+            # Encoder MPViT (tu mpvit_small ya acepta pretrained_ckpt=None)
+            self.models["encoder"] = networks.mpvit_small(pretrained_ckpt=mpvit_ckpt)
+            # Expón los canales para el decoder
+            self.models["encoder"].num_ch_enc = [64, 64, 128, 216, 288]
+            self.models["encoder"].to(self.device)
+            self.parameters_to_train += list(self.models["encoder"].parameters())
+
+            # Decoder: preferir el T si existe; si no, caer al clásico
+            if hasattr(networks, "DepthDecoderT"):
+                self.models["depth"] = networks.DepthDecoderT()
+            else:
+                self.models["depth"] = networks.DepthDecoder(self.models["encoder"].num_ch_enc, self.opt.scales)
+            self.models["depth"].to(self.device)
+            self.parameters_to_train += list(self.models["depth"].parameters())
+
+        else:
+            # === ResNet por defecto (lo que ya tenías) ===
+            self.models["encoder"] = networks.ResnetEncoder(
+                self.opt.num_layers, self.opt.weights_init == "pretrained")
+            self.models["encoder"].to(self.device)
+            self.parameters_to_train += list(self.models["encoder"].parameters())
+
+            self.models["depth"] = networks.DepthDecoder(
+                self.models["encoder"].num_ch_enc, self.opt.scales)
+            self.models["depth"].to(self.device)
+            self.parameters_to_train += list(self.models["depth"].parameters())
+
         if self.use_pose_net:
             if self.opt.pose_model_type == "separate_resnet":
                 self.models["pose_encoder"] = networks.ResnetEncoder(
