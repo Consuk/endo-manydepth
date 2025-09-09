@@ -96,6 +96,17 @@ class Trainer_Monodepth:
             self.models["depth"] = networks.DepthDecoderT()
             self.models["depth"].to(self.device)
             self.parameters_to_train += list(self.models["depth"].parameters())
+            print(f"Decoder class: {type(self.models['depth']).__name__}")
+            print(f"Backbone selected: {self.opt.backbone} -> Encoder class: {type(self.models['encoder']).__name__}")
+            enc_params = sum(p.numel() for p in self.models["encoder"].parameters() if p.requires_grad)
+            dec_params = sum(p.numel() for p in self.models["depth"].parameters() if p.requires_grad)
+            train_params = sum(p.numel() for p in self.parameters_to_train if p.requires_grad)
+            print(f"MPViT encoder param count: {enc_params}, decoder param count: {dec_params}, total in optimizer: {train_params}")
+            for name, param in self.models["encoder"].named_parameters():
+                if param.requires_grad:
+                    print("Encoder param:", name)
+                    break
+
 
         else:
             # ResNet (comportamiento original)

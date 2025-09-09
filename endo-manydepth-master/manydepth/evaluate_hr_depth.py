@@ -177,7 +177,8 @@ def evaluate(opt):
         pred_disps = []
         wmeta = getattr(opt, "width", WIDTH)
         hmeta = getattr(opt, "height", HEIGHT)
-        print("-> Computing predictions with size {}x{}".format(wmeta, hmeta))
+        print(f"-> Computing predictions with size {opt.width}x{opt.height}")
+
 
         with torch.no_grad():
             for data in dataloader:
