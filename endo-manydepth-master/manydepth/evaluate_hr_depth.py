@@ -105,52 +105,72 @@ def evaluate(opt):
             pin_memory=True, drop_last=False
         )
 
-        # ------- Elegir backbone (MPViT vs ResNet) ------
-        # 1) Si viene --backbone en options, lo respetamos
-        print("[backbone] MPViT + auto-decoder")
+        # ---------- MODELOS (MPViT o ResNet) + CARGA ROBUSTA ----------
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # 1) Instancia el MPViT small y fija los canales de salida para el decoder
-        encoder = networks.mpvit_small()
-        encoder.num_ch_enc = [64, 128, 216, 288, 288]   # 5 escalas para el decoder
+        encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
+        decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
 
-        # 2) Cargar pesos del encoder (robusto a distintos formatos)
-        enc_sd = torch.load(encoder_path, map_location="cpu")
-        if isinstance(enc_sd, dict) and "state_dict" in enc_sd and isinstance(enc_sd["state_dict"], dict):
-            enc_sd = enc_sd["state_dict"]
-        # quita prefijos típicos
-        enc_sd = {k.replace("module.", ""): v for k, v in enc_sd.items()}
-        enc_sd = {k.replace("encoder.", ""): v for k, v in enc_sd.items()}
+        def _unwrap_state_dict(ckpt, pref_candidates):
+            """Devuelve un state_dict plano desde distintos formatos de guardado."""
+            sd = ckpt
+            if isinstance(sd, dict):
+                for k in pref_candidates:
+                    if k in sd and isinstance(sd[k], dict):
+                        sd = sd[k]
+                        break
+            if isinstance(sd, dict):
+                sd = {k.replace("module.", ""): v for k, v in sd.items()}
+            return sd if isinstance(sd, dict) else {}
 
-        miss_e, unexp_e = encoder.load_state_dict(enc_sd, strict=False)
-        print(f"[encoder] missing: {len(miss_e)} unexpected: {len(unexp_e)}")
-
-        # 3) Leer pesos del decoder y decidir clase (DepthDecoderT vs DepthDecoder)
-        dec_sd = torch.load(decoder_path, map_location="cpu")
-        if isinstance(dec_sd, dict) and "state_dict" in dec_sd and isinstance(dec_sd["state_dict"], dict):
-            dec_sd = dec_sd["state_dict"]
-        dec_sd = {k.replace("module.", ""): v for k, v in dec_sd.items()}
-
-        # Heurística: los checkpoints de DepthDecoderT suelen tener submódulos "conv.conv"
-        use_T = any(".conv.conv." in k or "conv.conv.weight" in k for k in dec_sd.keys())
-
-        if use_T and hasattr(networks, "DepthDecoderT"):
-            depth_decoder = networks.DepthDecoderT()
+        # ---- encoder ----
+        if getattr(opt, "backbone", "resnet").lower() == "mpvit":
+            print("[backbone] MPViT + auto-decoder")
+            # canales de salida de MPViT por nivel: [64, 128, 216, 288, 288]
+            encoder = networks.mpvit_small(use_pretrained=False)   # no imagenet
+            encoder.num_ch_enc = [64, 128, 216, 288, 288]          # ← MUY IMPORTANTE
         else:
-            depth_decoder = networks.DepthDecoder(encoder.num_ch_enc)
+            print("[backbone] ResNet + DepthDecoder")
+            encoder = networks.ResnetEncoder(opt.num_layers, False)
 
-        # 4) Cargar pesos del decoder de forma robusta
-        model_dd = depth_decoder.state_dict()
-        # si el ckpt no trae prefijo "decoder.", añadimos cuando corresponda
-        if not any(k.startswith("decoder.") for k in dec_sd.keys()):
-            dec_sd = { (f"decoder.{k}" if f"decoder.{k}" in model_dd else k): v for k, v in dec_sd.items() }
+        ckpt_enc = torch.load(encoder_path, map_location="cpu")
+        sd_enc = _unwrap_state_dict(ckpt_enc, ["model", "state_dict", "encoder", "encoder_state_dict", "net", "weights"])
+        # si el sd viene con prefijo "encoder.", quítalo
+        sd_enc = { (k[8:] if k.startswith("encoder.") else k): v for k, v in sd_enc.items() }
+        # quita capas de clasificación si existieran
+        sd_enc = { k: v for k, v in sd_enc.items() if not k.startswith("fc.") }
 
-        filt_sd = {k: v for k, v in dec_sd.items() if k in model_dd}
-        miss_d, unexp_d = depth_decoder.load_state_dict(filt_sd, strict=False)
-        print(f"[decoder] missing: {len(miss_d)} unexpected: {len(unexp_d)}")
+        missing_e, unexpected_e = encoder.load_state_dict(sd_enc, strict=False)
+        print(f"[encoder] missing: {len(missing_e)} unexpected: {len(unexpected_e)}")
 
-        # 5) CUDA / eval
-        encoder.cuda(); encoder.eval()
-        depth_decoder.cuda(); depth_decoder.eval()
+        # ---- decoder ----
+        ckpt_dec = torch.load(decoder_path, map_location="cpu")
+        sd_dec = _unwrap_state_dict(ckpt_dec, ["model", "state_dict", "decoder", "decoder_state_dict", "net", "weights"])
+
+        # prueba primero con DepthDecoderT (transformer) y si no cuadra, usa DepthDecoder clásico
+        decoder = None
+        if hasattr(networks, "DepthDecoderT"):
+            try:
+                d = networks.DepthDecoderT()
+                model_dict = d.state_dict()
+                # filtra por nombre y shape
+                filtered = {k: v for k, v in sd_dec.items() if k in model_dict and tuple(model_dict[k].shape) == tuple(v.shape)}
+                if len(filtered) > 0:
+                    decoder = d
+                    missing_d, unexpected_d = decoder.load_state_dict(filtered, strict=False)
+                    print(f"[decoder] DepthDecoderT | missing: {len(missing_d)} unexpected: {len(unexpected_d)}")
+            except Exception:
+                decoder = None
+
+        if decoder is None:
+            decoder = networks.DepthDecoder(encoder.num_ch_enc)
+            missing_d, unexpected_d = decoder.load_state_dict(sd_dec, strict=False)
+            print(f"[decoder] DepthDecoder | missing: {len(missing_d)} unexpected: {len(unexpected_d)}")
+
+        encoder.to(device).eval()
+        decoder.to(device).eval()
+        # --------------------------------------------------------------
+
 
 
 
