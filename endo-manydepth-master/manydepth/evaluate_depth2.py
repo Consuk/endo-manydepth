@@ -42,7 +42,7 @@ def compute_depth_errors(gt, pred):
 
 
 
-def load_model(opt, device, encoder_type="resnet"):
+def load_model(opt, device, encoder_type="monovit"):
     if encoder_type == "monovit":
         encoder = networks.mpvit_small()
         encoder.num_ch_enc = [64, 64, 128, 216, 288]  # como en tu trainer.py
@@ -50,6 +50,7 @@ def load_model(opt, device, encoder_type="resnet"):
             decoder = networks.DepthDecoderT()
         else:
             decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=opt.scales)
+        print("Eval encoder:", type(encoder).__name__, "| decoder:", type(decoder).__name__)
     else:
         encoder = networks.ResnetEncoder(opt.num_layers, opt.weights_init == "pretrained")
         decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=opt.scales)
@@ -201,6 +202,7 @@ def main():
 
     assert evaluated > 0, "No se evaluó ningún ejemplo válido."
     mean = accum / evaluated
+
 
     print("\n-> Depth evaluation on '{}' ({} samples)".format(opt.eval_split, evaluated))
     print("   abs_rel:  {:.4f}".format(mean[0]))
