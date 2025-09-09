@@ -28,7 +28,7 @@ class MonodepthOptions:
         self.parser.add_argument("--backbone",
                              type=str,
                              choices=["resnet", "mpvit"],
-                              default="resnet",
+                              default="mpvit",
                               help="Encoder backbone a usar")
         self.parser.add_argument("--mpvit_ckpt",
                               type=str,
