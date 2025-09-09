@@ -186,8 +186,9 @@ def evaluate(opt):
                 if opt.post_process:
                     input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
 
-                output = depth_decoder(encoder(input_color))
-                pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
+                outputs = decoder(encoder(input_color))
+                pred_disp, _ = disp_to_depth(outputs[("disp", 0)], opt.min_depth, opt.max_depth)
+
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
                 pred_disps.append(pred_disp)
 
