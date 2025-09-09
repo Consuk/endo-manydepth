@@ -110,6 +110,7 @@ class Trainer_Monodepth:
 
         else:
             # ResNet (comportamiento original)
+            print("entrando a resnet")
             self.models["encoder"] = networks.ResnetEncoder(
                 self.opt.num_layers, self.opt.weights_init == "pretrained")
             self.models["encoder"].to(self.device)
