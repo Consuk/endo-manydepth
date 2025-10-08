@@ -13,6 +13,9 @@ from options import MonodepthOptions
 import datasets
 import networks
 
+print("GPU ID:", torch.cuda.current_device())
+print("GPU Name:", torch.cuda.get_device_name(0))
+
 
 def seed_all(seed):
     if not seed:
