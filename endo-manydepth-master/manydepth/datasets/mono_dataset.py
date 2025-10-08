@@ -141,6 +141,8 @@ class MonoDataset(data.Dataset):
         do_flip = False
         do_color_aug = False
         folder, frame_index, side = self.index_to_folder_and_frame_idx(index)
+        frame_index = int(frame_index)  # 👈 Esto corrige el error
+
 
         poses = {}
         # In the original Monodepth2 implementation, each training sample is composed of a
