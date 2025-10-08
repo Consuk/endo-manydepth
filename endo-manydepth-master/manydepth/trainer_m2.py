@@ -154,11 +154,13 @@ class Trainer_Monodepth:
             self.parameters_to_train += list(self.models["pose"].parameters())
 
 
-        self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
-        """self.model_lr_scheduler = optim.lr_scheduler.StepLR(
-            self.model_optimizer, self.opt.scheduler_step_size, 0.1)"""
-        self.model_lr_scheduler = optim.lr_scheduler.ExponentialLR(
-		self.model_optimizer,0.9)
+        # self.model_optimizer = optim.AdamW(self.parameters_to_train, self.opt.learning_rate)
+        # """self.model_lr_scheduler = optim.lr_scheduler.StepLR(
+        #     self.model_optimizer, self.opt.scheduler_step_size, 0.1)"""
+        # self.model_lr_scheduler = optim.lr_scheduler.ExponentialLR(
+		# self.model_optimizer,0.9)
+        self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
+        self.model_lr_scheduler = None
 
         if self.opt.load_weights_folder is not None:
             self.load_model()
@@ -302,7 +304,8 @@ class Trainer_Monodepth:
                 self.val()
 
             self.step += 1
-        self.model_lr_scheduler.step()
+        if self.model_lr_scheduler is not None:
+            self.model_lr_scheduler.step()
 
     def process_batch(self, inputs):
         """Pass a minibatch through the network and generate images and losses
