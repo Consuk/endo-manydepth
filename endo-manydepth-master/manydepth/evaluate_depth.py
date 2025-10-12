@@ -114,7 +114,7 @@ def evaluate(opt):
                                 pin_memory=True, drop_last=False)
 
         encoder = networks.ResnetEncoder(opt.num_layers, False)
-        depth_decoder = networks.DepthDecoder(encnum_layersoder.num_ch_enc, scales=range(4))
+        depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(4))
 
         #encoder2 = networks.ResnetEncoder(opt.num_layers, False)
 
