@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 
 #import wandb
 
-#wandb.init(project="iilDepth-Testing")
+#wandb.init(project="iilDepth-Testing", entity="respinosa")
 
 _DEPTH_COLORMAP = plt.get_cmap('plasma', 256)  # for plotting
 
@@ -76,7 +76,8 @@ def batch_post_process_disparity(l_disp, r_disp):
 
 
 def evaluate(opt):
-    """Evaluates a pretrained model using a specified test set"""
+    """Evaluates a pretrained model using a specified test set
+    """
     MIN_DEPTH = 1e-3
     MAX_DEPTH = 150
 
@@ -84,132 +85,81 @@ def evaluate(opt):
         "Please choose mono or stereo evaluation by setting either --eval_mono or --eval_stereo"
 
     if opt.ext_disp_to_eval is None:
-        # ------- Paths & split -------
+
         opt.load_weights_folder = os.path.expanduser(opt.load_weights_folder)
+
         assert os.path.isdir(opt.load_weights_folder), \
-            f"Cannot find a folder at {opt.load_weights_folder}"
+            "Cannot find a folder at {}".format(opt.load_weights_folder)
+
         print("-> Loading weights from {}".format(opt.load_weights_folder))
 
         filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
         encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
         decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
 
-               # ------- Dataset / Dataloader -------
-        HEIGHT, WIDTH = opt.height, opt.width
-        img_ext = '.png' if opt.png else '.jpg'
-        dataset = datasets.SCAREDRAWDataset(
-            opt.data_path, filenames, HEIGHT, WIDTH, [0], 4, is_train=False, img_ext=img_ext
-        )
-        dataloader = DataLoader(
-            dataset, opt.batch_size, shuffle=False, num_workers=opt.num_workers,
-            pin_memory=True, drop_last=False
-        )
+        encoder_dict = torch.load(encoder_path)
 
-        # ---------- MODELOS (MPViT o ResNet) + CARGA ROBUSTA ----------
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        """dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
+                                           encoder_dict['height'], encoder_dict['width'],
+                                           [0], 4, is_train=False)"""
+        HEIGHT, WIDTH = 256, 320      
+        img_ext = '.png' if opt.png else '.jpg'        
+        
+        dataset = datasets.SCAREDRAWDataset(opt.data_path, filenames,
+                                           HEIGHT, WIDTH,
+                                           [0], 4, is_train=False, img_ext=img_ext)                                        
+        dataloader = DataLoader(dataset, 8, shuffle=False, num_workers=opt.num_workers,
+                                pin_memory=True, drop_last=False)
 
-        encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
-        decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
+        encoder = networks.mpvit_small() #networks.ResnetEncoder(opt.num_layers, False)
+        encoder.num_ch_enc = [64,128,216,288,288]  # = networks.ResnetEncoder(opt.num_layers, False)
+        depth_decoder = networks.DepthDecoderT()
 
-        def _unwrap_state_dict(ckpt, pref_candidates):
-            """Devuelve un state_dict plano desde distintos formatos de guardado."""
-            sd = ckpt
-            if isinstance(sd, dict):
-                for k in pref_candidates:
-                    if k in sd and isinstance(sd[k], dict):
-                        sd = sd[k]
-                        break
-            if isinstance(sd, dict):
-                sd = {k.replace("module.", ""): v for k, v in sd.items()}
-            return sd if isinstance(sd, dict) else {}
+        model_dict = encoder.state_dict()
+        encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
+        depth_decoder.load_state_dict(torch.load(decoder_path))
 
-        # ---- encoder ----
-        if getattr(opt, "backbone", "resnet").lower() == "mpvit":
-            print("[backbone] MPViT + auto-decoder")
-            # canales de salida de MPViT por nivel: [64, 128, 216, 288, 288]
-            encoder = networks.mpvit_small(use_pretrained=False)   # no imagenet
-            encoder.num_ch_enc = [64, 128, 216, 288, 288]          # ← MUY IMPORTANTE
-        else:
-            print("[backbone] ResNet + DepthDecoder")
-            encoder = networks.ResnetEncoder(opt.num_layers, False)
-
-        ckpt_enc = torch.load(encoder_path, map_location="cpu")
-        sd_enc = _unwrap_state_dict(ckpt_enc, ["model", "state_dict", "encoder", "encoder_state_dict", "net", "weights"])
-        # si el sd viene con prefijo "encoder.", quítalo
-        sd_enc = { (k[8:] if k.startswith("encoder.") else k): v for k, v in sd_enc.items() }
-        # quita capas de clasificación si existieran
-        sd_enc = { k: v for k, v in sd_enc.items() if not k.startswith("fc.") }
-
-        missing_e, unexpected_e = encoder.load_state_dict(sd_enc, strict=False)
-        print(f"[encoder] missing: {len(missing_e)} unexpected: {len(unexpected_e)}")
-
-        # ---- decoder ----
-        ckpt_dec = torch.load(decoder_path, map_location="cpu")
-        sd_dec = _unwrap_state_dict(ckpt_dec, ["model", "state_dict", "decoder", "decoder_state_dict", "net", "weights"])
-
-        # prueba primero con DepthDecoderT (transformer) y si no cuadra, usa DepthDecoder clásico
-        decoder = None
-        if hasattr(networks, "DepthDecoderT"):
-            try:
-                d = networks.DepthDecoderT()
-                model_dict = d.state_dict()
-                # filtra por nombre y shape
-                filtered = {k: v for k, v in sd_dec.items() if k in model_dict and tuple(model_dict[k].shape) == tuple(v.shape)}
-                if len(filtered) > 0:
-                    decoder = d
-                    missing_d, unexpected_d = decoder.load_state_dict(filtered, strict=False)
-                    print(f"[decoder] DepthDecoderT | missing: {len(missing_d)} unexpected: {len(unexpected_d)}")
-            except Exception:
-                decoder = None
-
-        if decoder is None:
-            decoder = networks.DepthDecoder(encoder.num_ch_enc)
-            missing_d, unexpected_d = decoder.load_state_dict(sd_dec, strict=False)
-            print(f"[decoder] DepthDecoder | missing: {len(missing_d)} unexpected: {len(unexpected_d)}")
-
-        encoder.to(device).eval()
-        decoder.to(device).eval()
-        # --------------------------------------------------------------
-
-
-
+        encoder.cuda()
+        encoder.eval()
+        depth_decoder.cuda()
+        depth_decoder.eval()
 
         pred_disps = []
-        wmeta = getattr(opt, "width", WIDTH)
-        hmeta = getattr(opt, "height", HEIGHT)
-        print(f"-> Computing predictions with size {opt.width}x{opt.height}")
 
+        print("-> Computing predictions with size {}x{}".format(
+            encoder_dict['width'], encoder_dict['height']))
 
         with torch.no_grad():
             for data in dataloader:
                 input_color = data[("color", 0, 0)].cuda()
 
                 if opt.post_process:
+                    # Post-processed results require each image to have two forward passes
                     input_color = torch.cat((input_color, torch.flip(input_color, [3])), 0)
 
-                outputs = decoder(encoder(input_color))
-                pred_disp, _ = disp_to_depth(outputs[("disp", 0)], opt.min_depth, opt.max_depth)
+                output = depth_decoder(encoder(input_color))
 
+                pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
+
+                """
+                if opt.post_process:
+                    N = pred_disp.shape[0] // 2
+                    pred_disp = batch_post_process_disparity(pred_disp[:N], pred_disp[N:, :, ::-1])"""
+
                 pred_disps.append(pred_disp)
 
         pred_disps = np.concatenate(pred_disps)
-        # --- Colapsar post-proc (Monodepth v1) de 2N -> N ---
-        if opt.post_process:
-            N = pred_disps.shape[0] // 2
-            pred_disps = batch_post_process_disparity(
-                pred_disps[:N],                   # disparidades originales
-                pred_disps[N:, :, ::-1]           # disparidades de las imágenes volteadas (desvolteadas aquí)
-            )
-
 
     else:
-        # ------- Cargar predicciones desde archivo -------
+        # Load predictions from file
         print("-> Loading predictions from {}".format(opt.ext_disp_to_eval))
         pred_disps = np.load(opt.ext_disp_to_eval)
+
         if opt.eval_eigen_to_benchmark:
             eigen_to_benchmark_ids = np.load(
                 os.path.join(splits_dir, "benchmark", "eigen_to_benchmark_ids.npy"))
+
             pred_disps = pred_disps[eigen_to_benchmark_ids]
 
     if opt.save_pred_disps:
@@ -221,61 +171,103 @@ def evaluate(opt):
     if opt.no_eval:
         print("-> Evaluation disabled. Done.")
         quit()
+    """
+    elif opt.eval_split == 'benchmark':
+        save_dir = os.path.join(opt.load_weights_folder, "benchmark_predictions")
+        print("-> Saving out benchmark predictions to {}".format(save_dir))
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
 
-    # ------- Ground truth -------
+        for idx in range(len(pred_disps)):
+            disp_resized = cv2.resize(pred_disps[idx], (1216, 352))
+            depth = STEREO_SCALE_FACTOR / disp_resized
+            depth = np.clip(depth, 0, 80)
+            depth = np.uint16(depth * 256)
+            save_path = os.path.join(save_dir, "{:010d}.png".format(idx))
+            cv2.imwrite(save_path, depth)
+
+        print("-> No ground truth is available for the KITTI benchmark, so not evaluating. Done.")
+        quit()"""
+
     gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
-    gt_depths = np.load(gt_path, fix_imports=True, allow_pickle=True, encoding='latin1')["data"]
+    gt_depths = np.load(gt_path, fix_imports=True,allow_pickle=True, encoding='latin1')["data"]
 
     print("-> Evaluating")
+
     if opt.eval_stereo:
-        print("   Stereo evaluation - disabling median scaling, scaling by {}".format(STEREO_SCALE_FACTOR))
+        print("   Stereo evaluation - "
+              "disabling median scaling, scaling by {}".format(STEREO_SCALE_FACTOR))
         opt.disable_median_scaling = True
         opt.pred_depth_scale_factor = STEREO_SCALE_FACTOR
     else:
         print("   Mono evaluation - using median scaling")
 
-    errors, ratios = [], []
+    errors = []
+    ratios = []
 
     for i in range(pred_disps.shape[0]):
+
         gt_depth = gt_depths[i]
         gt_height, gt_width = gt_depth.shape[:2]
         pred_disp = pred_disps[i]
-
+        disp = colormap(pred_disp)
+        #wandb.log({"disp_testing": wandb.Image(disp.transpose(1, 2, 0))},step=i)
         pred_disp = cv2.resize(pred_disp, (gt_width, gt_height))
-        pred_depth = 1.0 / np.maximum(pred_disp, 1e-12)
+        pred_depth = 1 / pred_disp
 
+        #####
+        # Saving grayscale depth image
+        """
+        im_depth = gt_depth.astype(np.uint16)
+        im = pil.fromarray(im_depth)
+        output_name = os.path.splitext(os.path.basename(image_path))[0]
+        output_file = os.path.join(output_path, "{}_depth.png".format(output_name))
+        im.save(output_file)"""
+        #####
+        """
+        if opt.eval_split == "eigen":
+            mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
+
+            crop = np.array([0.40810811 * gt_height, 0.99189189 * gt_height,
+                             0.03594771 * gt_width,  0.96405229 * gt_width]).astype(np.int32)
+            crop_mask = np.zeros(mask.shape)
+            crop_mask[crop[0]:crop[1], crop[2]:crop[3]] = 1
+            mask = np.logical_and(mask, crop_mask)
+
+        else:"""
         mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
 
         pred_depth = pred_depth[mask]
-        gt_depth_m = gt_depth[mask]
+        gt_depth = gt_depth[mask]
 
+        #pred_depth *= opt.pred_depth_scale_factor
         if not opt.disable_median_scaling:
-            ratio = np.median(gt_depth_m) / np.median(pred_depth)
+            ratio = np.median(gt_depth) / np.median(pred_depth)
             ratios.append(ratio)
             pred_depth *= ratio
 
         pred_depth[pred_depth < MIN_DEPTH] = MIN_DEPTH
         pred_depth[pred_depth > MAX_DEPTH] = MAX_DEPTH
 
-        errors.append(compute_errors(gt_depth_m, pred_depth))
+        errors.append(compute_errors(gt_depth, pred_depth))
 
-    if not opt.disable_median_scaling and len(ratios) > 0:
+    if not opt.disable_median_scaling:
         ratios = np.array(ratios)
         med = np.median(ratios)
         print(" Scaling ratios | med: {:0.3f} | std: {:0.3f}".format(med, np.std(ratios / med)))
 
     mean_errors = np.array(errors).mean(0)
 
-    # ------- Guardar e imprimir resultados -------
-    with open('results.txt', mode='a') as results_edit:
-        results_edit.write("\n model_name: %s " % (opt.load_weights_folder))
-        results_edit.write("\n " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
-        results_edit.write("\n " + ("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
+
+
+    results_edit=open('results.txt',mode='a')
+    results_edit.write("\n " + 'model_name: %s '%(opt.load_weights_folder))
+    results_edit.write("\n " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
+    results_edit.write("\n " + ("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
+    results_edit.close()
     print("\n  " + ("{:>8} | " * 7).format("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"))
     print(("&{: 8.3f}  " * 7).format(*mean_errors.tolist()) + "\\\\")
     print("\n-> Done!")
-
-
 
 def colormap(inputs, normalize=True, torch_transpose=True):
         if isinstance(inputs, torch.Tensor):
