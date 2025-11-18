@@ -8,7 +8,6 @@ import cv2
 from collections import defaultdict
 from datasets import SCAREDRAWDataset
 
-
 import torch
 from torch.utils.data import DataLoader
 
@@ -45,7 +44,6 @@ def compute_errors(gt, pred):
     sq_rel  = np.mean(((gt - pred) ** 2) / gt)
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
-
 def load_model(load_weights_folder, num_layers, device):
     """Carga encoder.pth y depth.pth una sola vez."""
     encoder_path = os.path.join(load_weights_folder, "encoder.pth")
@@ -56,8 +54,9 @@ def load_model(load_weights_folder, num_layers, device):
     if not os.path.isfile(encoder_path) or not os.path.isfile(decoder_path):
         raise FileNotFoundError("Missing encoder.pth or depth.pth in weights folder")
 
-    encoder = networks.ResnetEncoder(num_layers, False)
-    depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(4))
+    encoder = networks.mpvit_small()
+    encoder.num_ch_enc = [64, 128, 216, 288, 288]
+    depth_decoder = networks.DepthDecoderT()
 
     encoder_dict = torch.load(encoder_path, map_location=device)
     model_dict = encoder.state_dict()
@@ -67,7 +66,6 @@ def load_model(load_weights_folder, num_layers, device):
     encoder.to(device).eval()
     depth_decoder.to(device).eval()
     return encoder, depth_decoder
-
 
 def _parse_split_line(line: str):
     """
@@ -81,7 +79,6 @@ def _parse_split_line(line: str):
     ds, keyf, frame_str, side = parts[0], parts[1], parts[2], parts[3]
     return ds, keyf, int(frame_str), side
 
-
 def _build_img_path(root, ds, keyf, frame_idx, png=False):
     """
     Construye la ruta real:
@@ -89,7 +86,6 @@ def _build_img_path(root, ds, keyf, frame_idx, png=False):
     """
     ext = ".png" if png else ".jpg"
     return os.path.join(root, ds, keyf, "data", f"{frame_idx}{ext}")
-
 
 class SimpleImageDataset(torch.utils.data.Dataset):
     """Dataset mínimo que toma rutas absolutas ya resueltas."""
@@ -107,7 +103,6 @@ class SimpleImageDataset(torch.utils.data.Dataset):
         img = np.asarray(img).astype(np.float32) / 255.0
         img = torch.from_numpy(img).permute(2, 0, 1)  # C,H,W
         return {("color", 0, 0): img}
-
 
 def map_split_to_existing_paths(data_path_root, filenames, png=False, strict=False):
     """
@@ -141,7 +136,6 @@ def map_split_to_existing_paths(data_path_root, filenames, png=False, strict=Fal
         )
 
     return idx_keep, real_paths, missing
-
 
 def evaluate_one_root(data_path_root,
                       filenames,
@@ -279,8 +273,6 @@ def evaluate_one_root(data_path_root,
     # abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
     return mean_errors
 
-
-
 def list_corruption_dirs(root):
     """
     Devuelve los directorios de primer nivel que representan corrupciones.
@@ -296,7 +288,6 @@ def list_corruption_dirs(root):
     # Si no, asumimos que root contiene muchas corrupciones como subcarpetas
     return [os.path.join(root, d) for d in sorted(os.listdir(root))
             if os.path.isdir(os.path.join(root, d))]
-
 
 def main():
     parser = argparse.ArgumentParser("Evaluate EndoVIS corruptions (16x5) with AF-SfMLearner weights")
