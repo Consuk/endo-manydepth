@@ -176,7 +176,8 @@ class Trainer_Monodepth:
                          "endovis": datasets.SCAREDDataset,
                          "RNNSLAM": datasets.SCAREDDataset,
                          "colon10k": datasets.SCAREDDataset,
-                         "C3VD": datasets.SCAREDDataset}
+                         "C3VD": datasets.SCAREDDataset, 
+                         "hamlyn": datasets.HamlynDataset}
 
         self.dataset = datasets_dict[self.opt.dataset]
 

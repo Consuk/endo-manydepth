@@ -159,7 +159,8 @@ class Trainer_Monodepth2:
                          "cityscapes_preprocessed": datasets.CityscapesPreprocessedDataset,
                          "kitti_odom": datasets.KITTIOdomDataset,
                          "endovis": datasets.SCAREDDataset,
-                         "RNNSLAM": datasets.SCAREDDataset}
+                         "RNNSLAM": datasets.SCAREDDataset, 
+                         "hamlyn": datasets.HamlynDataset}
 
         self.dataset = datasets_dict[self.opt.dataset]
 
