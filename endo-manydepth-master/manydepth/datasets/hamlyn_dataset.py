@@ -83,16 +83,40 @@ class HamlynDataset(MonoDataset):
 
     def get_image_path(self, folder, frame_index, side):
         """
-        Compose the absolute path to an image, including the frame index.  For
-        example:
+        Compose the absolute path to an image, including the frame index.  The
+        ``folder`` argument comes directly from the splits file and may be
+        provided in a number of formats, including:
 
-            /workspace/datasets/hamlyn/Hamlyn/rectified15/rectified15/image01/0000000001.jpg
+            ``rectified08/rectified08/image01`` (full path)
+            ``rectified08/rectified08`` (sequence without specifying camera)
+            ``rectified08`` (only sequence name)
 
-        If the computed file does not exist, neighbour snapping in
-        :meth:`get_color` will attempt to find the closest existing frame.
+        This method resolves the appropriate camera subdirectory based on the
+        provided ``side`` (left/right) and returns the fully qualified path
+        within ``self.data_path``.  Neighbour snapping in :meth:`get_color`
+        will handle missing files.
         """
+        # Determine the appropriate camera subdirectory
+        def _resolve_image_folder(base: str, side_flag: str) -> str:
+            parts = base.split('/')
+            # If the last part already specifies an image subfolder (image01/image02), return as is
+            if parts[-1].lower().startswith('image'):
+                return base
+            # If two parts are provided (e.g. rectified08/rectified08), append the camera
+            if len(parts) >= 2 and parts[1].lower().startswith('rectified'):
+                cam = 'image01' if (side_flag in ['l', 'L']) else 'image02'
+                return os.path.join(base, cam)
+            # If only the sequence name is provided, duplicate it and append the camera
+            if len(parts) == 1:
+                seq = parts[0]
+                cam = 'image01' if (side_flag in ['l', 'L']) else 'image02'
+                return os.path.join(seq, seq, cam)
+            # Fallback: return the original folder
+            return base
+
         frame_str = f"{frame_index:010d}"
-        return os.path.join(self.data_path, folder, frame_str + self.img_ext)
+        image_folder = _resolve_image_folder(folder, side or '')
+        return os.path.join(self.data_path, image_folder, frame_str + self.img_ext)
 
     def _find_neighbour_index(self, folder: str, frame_index: int, side: str, max_offset: int = 5) -> int:
         """
@@ -148,44 +172,53 @@ class HamlynDataset(MonoDataset):
         # Derive the path to the intrinsics file by taking the first two path
         # components of ``folder`` (e.g. rectified01/rectified01/image01 -> rectified01/rectified01)
         parts = folder.split('/')
+        # Derive the base directory that contains the intrinsics file.  If
+        # fewer than two parts are provided (e.g. ``rectified08``), duplicate
+        # the sequence name to form ``rectified08/rectified08``.  Otherwise,
+        # take the first two path segments.
         if len(parts) >= 2:
             base_dir = os.path.join(self.data_path, parts[0], parts[1])
-            intr_path = os.path.join(base_dir, "intrinsics.txt")
-            # Return cached intrinsics if available
-            if intr_path in self._intrinsic_cache:
-                return self._intrinsic_cache[intr_path].copy()
-            if os.path.exists(intr_path):
-                try:
-                    intr = np.loadtxt(intr_path)
-                    # intr may be 3x4; extract fx, fy, cx, cy from the first two rows
-                    if intr.ndim == 2 and intr.shape[0] >= 2:
-                        fx = float(intr[0, 0])
-                        cx = float(intr[0, 2])
-                        fy = float(intr[1, 1])
-                        cy = float(intr[1, 2])
-                        # Determine the original image size by reading the current frame
-                        img_w, img_h = None, None
-                        try:
-                            # Build path to the current image (the folder includes image subdir)
-                            sample_path = self.get_image_path(folder, frame_index, parts[-1] if len(parts) > 2 else None)
-                            with open(sample_path, 'rb') as f:
-                                im = pil.open(f)
-                                img_w, img_h = im.size
-                        except Exception:
-                            # Fall back to dataset target size if image cannot be read
-                            img_w, img_h = self.width, self.height
-                        # Normalise intrinsics
-                        K_norm = np.array([
-                            [fx / img_w, 0.0, cx / img_w, 0.0],
-                            [0.0, fy / img_h, cy / img_h, 0.0],
-                            [0.0, 0.0, 1.0, 0.0],
-                            [0.0, 0.0, 0.0, 1.0]
-                        ], dtype=np.float32)
-                        self._intrinsic_cache[intr_path] = K_norm
-                        return K_norm.copy()
-                except Exception:
-                    # Fall back to default if reading fails
-                    pass
+        elif len(parts) == 1:
+            base_dir = os.path.join(self.data_path, parts[0], parts[0])
+        else:
+            # Should not happen, but return default if it does
+            return self.K.copy()
+        intr_path = os.path.join(base_dir, "intrinsics.txt")
+        # Return cached intrinsics if available
+        if intr_path in self._intrinsic_cache:
+            return self._intrinsic_cache[intr_path].copy()
+        if os.path.exists(intr_path):
+            try:
+                intr = np.loadtxt(intr_path)
+                # intr may be 3x4; extract fx, fy, cx, cy from the first two rows
+                if intr.ndim == 2 and intr.shape[0] >= 2:
+                    fx = float(intr[0, 0])
+                    cx = float(intr[0, 2])
+                    fy = float(intr[1, 1])
+                    cy = float(intr[1, 2])
+                    # Determine the original image size by reading the current frame
+                    img_w, img_h = None, None
+                    try:
+                        # Build path to the current image.  Pass an empty side flag
+                        sample_path = self.get_image_path(folder, frame_index, '')
+                        with open(sample_path, 'rb') as f:
+                            im = pil.open(f)
+                            img_w, img_h = im.size
+                    except Exception:
+                        # Fall back to dataset target size if image cannot be read
+                        img_w, img_h = self.width, self.height
+                    # Normalise intrinsics
+                    K_norm = np.array([
+                        [fx / img_w, 0.0, cx / img_w, 0.0],
+                        [0.0, fy / img_h, cy / img_h, 0.0],
+                        [0.0, 0.0, 1.0, 0.0],
+                        [0.0, 0.0, 0.0, 1.0]
+                    ], dtype=np.float32)
+                    self._intrinsic_cache[intr_path] = K_norm
+                    return K_norm.copy()
+            except Exception:
+                # Fall back to default if reading fails
+                pass
         # Default behaviour: return the original normalised K
         return self.K.copy()
 
