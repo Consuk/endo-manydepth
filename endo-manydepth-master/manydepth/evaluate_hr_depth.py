@@ -109,8 +109,13 @@ def build_eval_dataset(opt, filenames):
 def evaluate(opt):
     """Evaluates a pretrained model using a specified test set
     """
-    MIN_DEPTH = 1e-3
-    MAX_DEPTH = 150
+    # Use the user-specified depth bounds from the options for thresholding.
+    # These values control the minimum and maximum depths that are considered
+    # valid when computing error metrics.  Previously these were fixed to
+    # 1e-3 and 150, but for Hamlyn evaluation we allow them to be passed via
+    # ``--min_depth`` and ``--max_depth`` (e.g. 1 and 50).
+    MIN_DEPTH = opt.min_depth
+    MAX_DEPTH = opt.max_depth
 
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
         "Please choose mono or stereo evaluation by setting either --eval_mono or --eval_stereo"

@@ -35,34 +35,45 @@ from datasets.mono_dataset import MonoDataset
 
 
 class HamlynDataset(MonoDataset):
-    """Superclass for loading monocular frames from the Hamlyn dataset."""
+    """Dataset loader for the Hamlyn endoscopic sequences with dynamic intrinsics and
+    neighbour snapping.
+
+    Each sequence has its own ``intrinsics.txt`` file located in the second-level
+    directory (e.g. ``rectified01/rectified01/intrinsics.txt``).  At runtime
+    the loader reads this file and normalises the intrinsics to the current
+    image dimensions.  If a requested neighbouring frame is missing, the loader
+    searches for the closest available frame index within a small window and
+    returns that image instead (neighbour snapping).
+    """
 
     def __init__(self, *args, **kwargs):
         super(HamlynDataset, self).__init__(*args, **kwargs)
-        # Intrinsic matrix normalised for 320×256 images.
-        # fx = fy = 700 (64×48 sensor), cx=cy centred.  The loader rescales
-        # this to the resolution set via --height and --width.
+        # Default normalised intrinsic matrix for Hamlyn sequences.  This will
+        # be used as a fallback when per-sequence intrinsics are unavailable.
         self.K = np.array([
             [1.2270, 0.0,    0.5296, 0.0],
             [0.0,    1.2067, 0.4012, 0.0],
             [0.0,    0.0,    1.0,    0.0],
             [0.0,    0.0,    0.0,    1.0]
         ], dtype=np.float32)
+        # Cache for per-sequence intrinsics to avoid re-reading the file on every call
+        self._intrinsic_cache = {}
         # Map side indicators to indices (unused here but provided for completeness)
         self.side_map = {"l": 2, "r": 3}
 
     def check_depth(self):
-        # """Enable depth supervision when requested. true para cuando se entrena""" 
+        # Depth supervision is disabled by default for Hamlyn sequences.  Override
+        # this method if you wish to enable loading ground truth depth maps.
         return False
 
     def index_to_folder_and_frame_idx(self, index):
         """
-        Each line in ``self.filenames`` is expected to have the form::
+        Parse a line from ``self.filenames``.  Each line should have the form
 
-            <relative/path/to/frame> <frame_index> <side>
+            ``<relative/path/to/frame> <frame_index> <side>``
 
-        Only ``folder`` (relative path) is needed to load the image.
-        ``frame_index`` and ``side`` are preserved for API compatibility.
+        Only ``folder`` (relative path) is needed to load the image.  ``frame_index``
+        and ``side`` are preserved for API compatibility.
         """
         parts = self.filenames[index].split()
         folder = parts[0]
@@ -72,28 +83,117 @@ class HamlynDataset(MonoDataset):
 
     def get_image_path(self, folder, frame_index, side):
         """
-        Compose the absolute path to an image, including the frame index.
-        Example output:
-        /workspace/datasets/hamlyn/Hamlyn/rectified15/rectified15/image01/0000000001.jpg
+        Compose the absolute path to an image, including the frame index.  For
+        example:
+
+            /workspace/datasets/hamlyn/Hamlyn/rectified15/rectified15/image01/0000000001.jpg
+
+        If the computed file does not exist, neighbour snapping in
+        :meth:`get_color` will attempt to find the closest existing frame.
         """
-        frame_str = f"{frame_index:010d}"  # 1 -> "0000000001"
+        frame_str = f"{frame_index:010d}"
         return os.path.join(self.data_path, folder, frame_str + self.img_ext)
 
+    def _find_neighbour_index(self, folder: str, frame_index: int, side: str, max_offset: int = 5) -> int:
+        """
+        Attempt to locate the closest existing frame index if the requested
+        ``frame_index`` does not correspond to an existing file.  The search
+        iterates over offsets ±1, ±2, … up to ``max_offset`` and returns
+        the index of the first existing image.  If no neighbour is found, the
+        original index is returned and the caller may raise an exception.
+        """
+        for offset in range(1, max_offset + 1):
+            # Search previous then next
+            for sign in (-1, 1):
+                neighbour = frame_index + sign * offset
+                if neighbour < 0:
+                    continue
+                candidate_path = self.get_image_path(folder, neighbour, side)
+                if os.path.exists(candidate_path):
+                    return neighbour
+        # Fallback to original index (will likely raise later if file does not exist)
+        return frame_index
+
     def get_color(self, folder, frame_index, side, do_flip):
-        """Load an RGB image and optionally flip it horizontally."""
-        color = self.loader(self.get_image_path(folder, frame_index, side))
+        """
+        Load an RGB image for the given ``folder`` and ``frame_index``.  If the
+        requested frame does not exist on disk, neighbour snapping is performed
+        to locate the closest available frame index within a small window.  The
+        loaded image is optionally flipped horizontally if ``do_flip`` is True.
+        """
+        # Compute the nominal path
+        image_path = self.get_image_path(folder, frame_index, side)
+        # If the file is missing, find the closest neighbour
+        if not os.path.exists(image_path):
+            snapped_index = self._find_neighbour_index(folder, frame_index, side)
+            image_path = self.get_image_path(folder, snapped_index, side)
+        # Load the image
+        color = self.loader(image_path)
         if do_flip:
             color = color.transpose(pil.FLIP_LEFT_RIGHT)
         return color
 
+    def load_intrinsics(self, folder, frame_index):
+        """
+        Load and normalise the camera intrinsic matrix for the given sequence.
+
+        The Hamlyn dataset provides a per-sequence ``intrinsics.txt`` file
+        located at ``<sequence>/<sequence>/intrinsics.txt``.  Each file stores
+        a 3×4 matrix in pixel units.  This method reads the matrix, extracts
+        the focal lengths and principal point, and converts them into a normalised
+        4×4 intrinsic matrix compatible with the scaling performed in
+        :class:`MonoDataset`.  If the file cannot be read, the default
+        normalised matrix from ``self.K`` is returned.
+        """
+        # Derive the path to the intrinsics file by taking the first two path
+        # components of ``folder`` (e.g. rectified01/rectified01/image01 -> rectified01/rectified01)
+        parts = folder.split('/')
+        if len(parts) >= 2:
+            base_dir = os.path.join(self.data_path, parts[0], parts[1])
+            intr_path = os.path.join(base_dir, "intrinsics.txt")
+            # Return cached intrinsics if available
+            if intr_path in self._intrinsic_cache:
+                return self._intrinsic_cache[intr_path].copy()
+            if os.path.exists(intr_path):
+                try:
+                    intr = np.loadtxt(intr_path)
+                    # intr may be 3x4; extract fx, fy, cx, cy from the first two rows
+                    if intr.ndim == 2 and intr.shape[0] >= 2:
+                        fx = float(intr[0, 0])
+                        cx = float(intr[0, 2])
+                        fy = float(intr[1, 1])
+                        cy = float(intr[1, 2])
+                        # Determine the original image size by reading the current frame
+                        img_w, img_h = None, None
+                        try:
+                            # Build path to the current image (the folder includes image subdir)
+                            sample_path = self.get_image_path(folder, frame_index, parts[-1] if len(parts) > 2 else None)
+                            with open(sample_path, 'rb') as f:
+                                im = pil.open(f)
+                                img_w, img_h = im.size
+                        except Exception:
+                            # Fall back to dataset target size if image cannot be read
+                            img_w, img_h = self.width, self.height
+                        # Normalise intrinsics
+                        K_norm = np.array([
+                            [fx / img_w, 0.0, cx / img_w, 0.0],
+                            [0.0, fy / img_h, cy / img_h, 0.0],
+                            [0.0, 0.0, 1.0, 0.0],
+                            [0.0, 0.0, 0.0, 1.0]
+                        ], dtype=np.float32)
+                        self._intrinsic_cache[intr_path] = K_norm
+                        return K_norm.copy()
+                except Exception:
+                    # Fall back to default if reading fails
+                    pass
+        # Default behaviour: return the original normalised K
+        return self.K.copy()
+
     def get_depth(self, folder, frame_index, side, do_flip):
         """
-        Load the ground truth depth map (if available) for the given frame.
-
-        It looks for depth in ``depth01`` (left camera) or ``depth02`` (right camera)
-        within the same rectifiedXX/rectifiedXX directory.  Depth values are
-        returned in metres; if the raw data are in millimetres the values are
-        divided by 1000.0.  If no depth is found a FileNotFoundError is raised.
+        Load the ground truth depth map (if available) for the given frame.  Depth
+        values are assumed to be stored in millimetres and are converted to
+        metres.  If ``do_flip`` is True, the depth map is flipped horizontally.
         """
         parts = folder.split('/')
         if len(parts) < 3:

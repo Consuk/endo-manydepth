@@ -24,6 +24,8 @@ wandb.init(project="MySfMLearner2")
 
 
 import json
+import copy
+from evaluate_hr_depth import evaluate as evaluate_hr
 
 from utils import *
 from layers import *
@@ -238,8 +240,23 @@ class Trainer:
                 self.freeze_teacher()
 
             self.run_epoch()
+            # At the end of each epoch, save the current model weights
+            # so that evaluation can be performed on the latest checkpoint.
             if (self.epoch + 1) % self.opt.save_frequency == 0:
                 self.save_model()
+            else:
+                # Save weights every epoch regardless of the save_frequency so
+                # that evaluation uses the most recent checkpoint.
+                self.save_model()
+
+            # Perform full-resolution evaluation on the Hamlyn test split after
+            # each epoch.  This calls the evaluation routine from
+            # ``evaluate_hr_depth`` with appropriate options.  Errors are
+            # captured so as not to interrupt training if evaluation fails.
+            try:
+                self.evaluate_epoch()
+            except Exception as e:
+                print(f"Evaluation at epoch {self.epoch} failed: {e}")
 
     def freeze_teacher(self):
         if self.train_teacher_and_pose:
@@ -299,6 +316,36 @@ class Trainer:
 
             self.step += 1
         self.model_lr_scheduler.step()
+
+    def evaluate_epoch(self):
+        """
+        Evaluate the current model on the Hamlyn test split at the end of an
+        epoch.  This wraps the high-resolution evaluation script and passes in
+        the appropriate options for the Hamlyn dataset.  The evaluation uses
+        median scaling and computes standard depth metrics.  Depth bounds are
+        set to [1, 50] for Hamlyn experiments.
+        """
+        # Create a fresh copy of the options so that evaluation settings can be
+        # modified without affecting the training configuration.
+        eval_opts = copy.deepcopy(self.opt)
+        # Ensure that the evaluation uses the Hamlyn split and dataset path
+        eval_opts.eval_split = self.opt.split
+        eval_opts.data_path = self.opt.data_path
+        # Load the most recent weights from the log directory
+        eval_opts.load_weights_folder = self.log_path
+        # Enable monocular evaluation; disable stereo
+        eval_opts.eval_mono = True
+        eval_opts.eval_stereo = False
+        # Use the desired depth range for evaluation (in metres)
+        eval_opts.min_depth = 1.0
+        eval_opts.max_depth = 50.0
+        # Do not disable evaluation
+        eval_opts.no_eval = False
+        # Ensure that the disparity file is not loaded from disk
+        eval_opts.ext_disp_to_eval = None
+        # Perform evaluation.  Any exceptions are propagated to the caller.
+        print(f"\n--> Evaluating model at epoch {self.epoch + 1}...")
+        evaluate_hr(eval_opts)
 
     def process_batch(self, inputs, is_train=False):
         """Pass a minibatch through the network and generate images and losses
