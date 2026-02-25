@@ -115,7 +115,8 @@ def evaluate(opt):
         encoder.num_ch_enc = [64,128,216,288,288]  # = networks.ResnetEncoder(opt.num_layers, False)
         depth_decoder = networks.DepthDecoder(
             encoder.num_ch_enc,
-            scales=range(4)  # This matches how it's constructed in your training
+            scales=range(4),  # This matches how it's constructed in your training
+            num_ch_dec=[64, 128, 216, 288, 288]
         )
 
 
