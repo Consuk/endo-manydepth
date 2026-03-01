@@ -44,8 +44,9 @@ def disp_to_depth(disp, min_depth, max_depth):
     return scaled_disp, depth
 
 def compute_errors(gt, pred):
-    """Computation of error metrics between predicted and ground truth depths
-    """
+    gt = np.asarray(gt, dtype=np.float32)
+    pred = np.asarray(pred, dtype=np.float32)
+
     thresh = np.maximum((gt / pred), (pred / gt))
     a1 = (thresh < 1.25     ).mean()
     a2 = (thresh < 1.25 ** 2).mean()
@@ -58,11 +59,9 @@ def compute_errors(gt, pred):
     rmse_log = np.sqrt(rmse_log.mean())
 
     abs_rel = np.mean(np.abs(gt - pred) / gt)
-
     sq_rel = np.mean(((gt - pred) ** 2) / gt)
 
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
-
 
 def batch_post_process_disparity(l_disp, r_disp):
     """Apply the disparity post-processing method as introduced in Monodepthv1
