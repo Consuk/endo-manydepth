@@ -39,6 +39,9 @@ class C3VDDataset(MonoDataset):
         self.intrinsics_file = intrinsics_file
         self._intrinsics_map = self._load_intrinsics_map(intrinsics_file)
         self._frame_cache = {}
+        self._intrinsics_cache = {}
+        self._image_size_cache = {}
+        self._global_intrinsics_cache = None
 
     def check_depth(self):
         return False
@@ -73,23 +76,35 @@ class C3VDDataset(MonoDataset):
         return image_path
 
     def load_intrinsics(self, folder, frame_index):
-        if not self._intrinsics_map:
-            return self.K.copy()
-
         norm_folder = folder.replace("\\", "/")
-        candidates = [
+        cached = self._intrinsics_cache.get(norm_folder)
+        if cached is not None:
+            return cached.copy()
+
+        # Priority A: explicit mapping file passed via --c3vd_intrinsics_file
+        map_intrinsics = self._lookup_intrinsics_map(norm_folder, frame_index)
+        if map_intrinsics is not None:
+            self._intrinsics_cache[norm_folder] = map_intrinsics
+            return map_intrinsics.copy()
+
+        # Priority B: per-sequence intrinsics files inside each sequence folder
+        seq_intrinsics = self._load_intrinsics_from_candidates(
+            self._sequence_intrinsics_candidates(norm_folder),
             norm_folder,
-            norm_folder.rstrip("/"),
-            os.path.basename(norm_folder.rstrip("/")),
-        ]
+            frame_index,
+        )
+        if seq_intrinsics is not None:
+            self._intrinsics_cache[norm_folder] = seq_intrinsics
+            return seq_intrinsics.copy()
 
-        for key in candidates:
-            if key in self._intrinsics_map:
-                return self._intrinsics_map[key].copy()
+        # Priority C: dataset-global fallback intrinsics files
+        global_intrinsics = self._load_global_intrinsics(norm_folder, frame_index)
+        if global_intrinsics is not None:
+            self._intrinsics_cache[norm_folder] = global_intrinsics
+            return global_intrinsics.copy()
 
-        if "default" in self._intrinsics_map:
-            return self._intrinsics_map["default"].copy()
-
+        # Priority D: hardcoded normalized fallback
+        self._intrinsics_cache[norm_folder] = self.K.copy()
         return self.K.copy()
 
     def _resolve_frame_path(self, folder, frame_index):
@@ -251,6 +266,185 @@ class C3VDDataset(MonoDataset):
                         mapping[key] = K
 
         return mapping
+
+    def _lookup_intrinsics_map(self, norm_folder, frame_index):
+        if not self._intrinsics_map:
+            return None
+
+        candidates = [
+            norm_folder,
+            norm_folder.rstrip("/"),
+            os.path.basename(norm_folder.rstrip("/")),
+        ]
+
+        for key in candidates:
+            if key in self._intrinsics_map:
+                return self._finalize_intrinsics_matrix(
+                    self._intrinsics_map[key], norm_folder, frame_index
+                )
+
+        if "default" in self._intrinsics_map:
+            return self._finalize_intrinsics_matrix(
+                self._intrinsics_map["default"], norm_folder, frame_index
+            )
+
+        return None
+
+    def _sequence_intrinsics_candidates(self, folder):
+        names = ("intrinsics.txt", "camera_intrinsics.txt", "intrinsics.npy")
+        paths = []
+        seen = set()
+
+        for root in self._candidate_roots(folder):
+            for name in names:
+                p = os.path.normpath(os.path.join(root, name))
+                if p not in seen:
+                    paths.append(p)
+                    seen.add(p)
+
+        return paths
+
+    def _global_intrinsics_candidates(self):
+        names = ("intrinsics.txt", "camera_intrinsics.txt", "intrinsics.npy")
+        roots = [
+            self.data_path,
+            os.path.join(self.data_path, "camera"),
+            os.path.join(self.data_path, "calibration"),
+        ]
+
+        paths = []
+        seen = set()
+        for root in roots:
+            for name in names:
+                p = os.path.normpath(os.path.join(root, name))
+                if p not in seen:
+                    paths.append(p)
+                    seen.add(p)
+        return paths
+
+    def _load_global_intrinsics(self, folder, frame_index):
+        if isinstance(self._global_intrinsics_cache, np.ndarray):
+            return self._global_intrinsics_cache.copy()
+        if self._global_intrinsics_cache is False:
+            return None
+
+        intrinsics = self._load_intrinsics_from_candidates(
+            self._global_intrinsics_candidates(), folder, frame_index
+        )
+        if intrinsics is not None:
+            self._global_intrinsics_cache = intrinsics.copy()
+            return intrinsics
+
+        self._global_intrinsics_cache = False
+        return None
+
+    def _load_intrinsics_from_candidates(self, candidates, folder, frame_index):
+        for path in candidates:
+            if not os.path.isfile(path):
+                continue
+
+            intrinsics = self._read_intrinsics_file(path, folder, frame_index)
+            if intrinsics is not None:
+                return intrinsics
+
+        return None
+
+    def _read_intrinsics_file(self, path, folder, frame_index):
+        _, ext = os.path.splitext(path)
+        ext = ext.lower()
+
+        if ext == ".npy":
+            try:
+                matrix = np.load(path)
+            except Exception:
+                return None
+            return self._finalize_intrinsics_matrix(matrix, folder, frame_index)
+
+        rows = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.split("#", 1)[0].strip()
+                    if not line:
+                        continue
+                    parts = re.split(r"[\s,]+", line)
+                    if not self._all_numeric(parts):
+                        continue
+                    rows.append([float(x) for x in parts])
+        except (OSError, UnicodeDecodeError):
+            return None
+
+        if not rows:
+            return None
+
+        # Common per-sequence format: 3x3 matrix in pixel units.
+        if len(rows) >= 3 and all(len(r) >= 3 for r in rows[:3]):
+            matrix = np.array([r[:3] for r in rows[:3]], dtype=np.float32)
+            return self._finalize_intrinsics_matrix(matrix, folder, frame_index)
+
+        # Alternative compact format: width height fx fy cx cy
+        if len(rows[0]) >= 6:
+            matrix = self._matrix_from_wh_fx_fy_cx_cy(*rows[0][:6])
+            return self._finalize_intrinsics_matrix(matrix, folder, frame_index)
+
+        return None
+
+    def _finalize_intrinsics_matrix(self, matrix, folder, frame_index):
+        if matrix is None:
+            return None
+
+        K = np.array(matrix, dtype=np.float32)
+        if K.shape == (4, 4):
+            K4 = K.copy()
+        elif K.shape == (3, 3):
+            K4 = np.eye(4, dtype=np.float32)
+            K4[:3, :3] = K
+        else:
+            return None
+
+        fx = float(K4[0, 0])
+        fy = float(K4[1, 1])
+        cx = float(K4[0, 2])
+        cy = float(K4[1, 2])
+
+        if self._is_pixel_like_intrinsics(fx, fy, cx, cy):
+            image_size = self._get_frame_size(folder, frame_index)
+            if image_size is None:
+                return None
+
+            width, height = image_size
+            if width <= 0 or height <= 0:
+                return None
+
+            K4 = K4.copy()
+            K4[0, 0] /= float(width)
+            K4[0, 2] /= float(width)
+            K4[1, 1] /= float(height)
+            K4[1, 2] /= float(height)
+
+        return K4.astype(np.float32)
+
+    def _get_frame_size(self, folder, frame_index):
+        cache_key = folder.replace("\\", "/")
+        if cache_key in self._image_size_cache:
+            return self._image_size_cache[cache_key]
+
+        frame_path = self._resolve_frame_path(folder, int(frame_index))
+        if frame_path is None:
+            return None
+
+        try:
+            with pil.open(frame_path) as img:
+                size = img.size
+        except OSError:
+            return None
+
+        self._image_size_cache[cache_key] = size
+        return size
+
+    @staticmethod
+    def _is_pixel_like_intrinsics(fx, fy, cx, cy):
+        return max(abs(fx), abs(fy), abs(cx), abs(cy)) > 10.0
 
     def _parse_intrinsics_payload(self, payload):
         mapping = {}
