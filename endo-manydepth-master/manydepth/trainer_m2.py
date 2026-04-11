@@ -55,6 +55,36 @@ def seed_worker(worker_id):
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
+
+def _resolve_split_file(split_dir, names):
+    for name in names:
+        path = os.path.join(split_dir, "{}_files.txt".format(name))
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "Could not find split file in '{}' for any of {}".format(split_dir, names)
+    )
+
+
+def _effective_num_workers(requested_workers):
+    if requested_workers <= 0:
+        return 0
+
+    if os.name != "posix":
+        return requested_workers
+
+    try:
+        st = os.statvfs("/dev/shm")
+        shm_bytes = st.f_bavail * st.f_frsize
+    except Exception:
+        return requested_workers
+
+    if shm_bytes < 256 * 1024 * 1024:
+        return min(requested_workers, 2)
+    if shm_bytes < 512 * 1024 * 1024:
+        return min(requested_workers, 4)
+    return requested_workers
+
 class Trainer_Monodepth:
     def __init__(self, options):
         self.opt = options
@@ -170,38 +200,93 @@ class Trainer_Monodepth:
         print("Training is using:\n  ", self.device)
 
         # DATA
-        datasets_dict = {"kitti": datasets.KITTIRAWDataset,
-                         "cityscapes_preprocessed": datasets.CityscapesPreprocessedDataset,
-                         "kitti_odom": datasets.KITTIOdomDataset,
-                         "endovis": datasets.SCAREDDataset,
-                         "RNNSLAM": datasets.SCAREDDataset,
-                         "colon10k": datasets.SCAREDDataset,
-                         "C3VD": datasets.SCAREDDataset, 
-                         "hamlyn": datasets.HamlynDataset}
+        dataset_key = self.opt.dataset.lower()
+        datasets_dict = {
+            "kitti": datasets.KITTIRAWDataset,
+            "cityscapes_preprocessed": datasets.CityscapesPreprocessedDataset,
+            "kitti_odom": datasets.KITTIOdomDataset,
+            "endovis": datasets.SCAREDDataset,
+            "rnnslam": datasets.SCAREDDataset,
+            "colon10k": datasets.SCAREDDataset,
+            "c3vd": datasets.C3VDDataset,
+            "hamlyn": datasets.HamlynDataset,
+        }
+        if dataset_key not in datasets_dict:
+            raise ValueError("Unsupported dataset '{}'".format(self.opt.dataset))
+        if dataset_key == "c3vd" and datasets_dict[dataset_key] is None:
+            raise ImportError(
+                "C3VDDataset could not be imported. Check datasets/c3vd_dataset.py dependencies."
+            )
+        self.dataset = datasets_dict[dataset_key]
 
-        self.dataset = datasets_dict[self.opt.dataset]
+        split_dir = resolve_split_dir(
+            self.opt.split, getattr(self.opt, "split_root", ""), os.path.dirname(__file__)
+        )
+        train_file = _resolve_split_file(split_dir, ("train", "training"))
+        val_file = _resolve_split_file(split_dir, ("val", "validation", "test"))
 
-        fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
+        train_filenames = readlines(train_file)
+        val_filenames = readlines(val_file)
 
-        train_filenames = readlines(fpath.format("train"))
-        val_filenames = readlines(fpath.format("val"))
-        img_ext = '.jpg'
+        # C3VD is distributed mainly as PNG sequences.
+        img_ext = ".png" if (self.opt.png or dataset_key == "c3vd") else ".jpg"
+
+        dataset_kwargs = {}
+        if dataset_key == "c3vd":
+            intrinsics_file = getattr(self.opt, "c3vd_intrinsics_file", "")
+            if intrinsics_file:
+                dataset_kwargs["intrinsics_file"] = intrinsics_file
 
         num_train_samples = len(train_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
 
+        effective_workers = _effective_num_workers(self.opt.num_workers)
+        if effective_workers != self.opt.num_workers:
+            print(
+                "Adjusted num_workers from {} to {} due to low shared memory.".format(
+                    self.opt.num_workers, effective_workers
+                )
+            )
+
         train_dataset = self.dataset(
-            self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
-            self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+            self.opt.data_path,
+            train_filenames,
+            self.opt.height,
+            self.opt.width,
+            self.opt.frame_ids,
+            4,
+            is_train=True,
+            img_ext=img_ext,
+            **dataset_kwargs
+        )
         self.train_loader = DataLoader(
-            train_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            train_dataset,
+            self.opt.batch_size,
+            True,
+            num_workers=effective_workers,
+            pin_memory=True,
+            drop_last=True,
+            worker_init_fn=seed_worker,
+        )
         val_dataset = self.dataset(
-            self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
-            self.opt.frame_ids, 4, is_train=False, img_ext=img_ext)
+            self.opt.data_path,
+            val_filenames,
+            self.opt.height,
+            self.opt.width,
+            self.opt.frame_ids,
+            4,
+            is_train=False,
+            img_ext=img_ext,
+            **dataset_kwargs
+        )
         self.val_loader = DataLoader(
-            val_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            val_dataset,
+            self.opt.batch_size,
+            True,
+            num_workers=effective_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
         self.val_iter = iter(self.val_loader)
 
 
@@ -237,12 +322,16 @@ class Trainer_Monodepth:
 
         self.wandb_enabled = os.getenv("WANDB_DISABLED", "").lower() not in ("true", "1", "yes")
         if self.wandb_enabled and (wandb is not None) and getattr(wandb, "run", None) is None:
+            wandb_project = self.opt.wandb_project or os.getenv("WANDB_PROJECT", "ManyDepth")
+            wandb_entity = self.opt.wandb_entity or os.getenv("WANDB_ENTITY", None)
+            wandb_mode = self.opt.wandb_mode or os.getenv("WANDB_MODE", "online")
+            wandb_name = self.opt.wandb_run_name or self.opt.model_name
             wandb.init(
-                project=os.getenv("WANDB_PROJECT","ManyDepth"),
-                entity=os.getenv("WANDB_ENTITY", None),
-                name=self.opt.model_name,
+                project=wandb_project,
+                entity=wandb_entity,
+                name=wandb_name,
                 config=vars(self.opt),
-                mode=os.getenv("WANDB_MODE","online"),
+                mode=wandb_mode,
                 resume="never",
             )
             print("W&B run URL:", wandb.run.url)
@@ -361,11 +450,10 @@ class Trainer_Monodepth:
             for f_i in self.opt.frame_ids[1:]:
                 if f_i != "s":
                     # To maintain ordering we always pass frames in temporal order
-                    #if f_i < 0:
-                    pose_inputs = [pose_feats[f_i], pose_feats[0]]
-                    #else:
-                    #pose_inputs = [pose_feats[0], pose_feats[f_i]]
-                    
+                    if f_i < 0:
+                        pose_inputs = [pose_feats[f_i], pose_feats[0]]
+                    else:
+                        pose_inputs = [pose_feats[0], pose_feats[f_i]]
 
                     if self.opt.pose_model_type == "separate_resnet":
                         pose_inputs = [self.models["pose_encoder"](torch.cat(pose_inputs, 1))]
@@ -379,12 +467,8 @@ class Trainer_Monodepth:
                     outputs[("axisangle", 0, f_i)] = axisangle
                     outputs[("translation", 0, f_i)] = translation
 
-                    # Invert the matrix if the frame id is negative
-                    """outputs[("cam_T_cam", 0, f_i)] = transformation_from_parameters(
-                        axisangle[:, 0], translation[:, 0], invert=(f_i < 0))"""
-
                     outputs[("cam_T_cam", 0, f_i)] = transformation_from_parameters(
-                        axisangle[:, 0], translation[:, 0])
+                        axisangle[:, 0], translation[:, 0], invert=(f_i < 0))
                     
                     outputs_lighting = self.models["lighting"](pose_inputs[0])
                     
@@ -398,6 +482,8 @@ class Trainer_Monodepth:
                         
             #Lighting
             for f_i in self.opt.frame_ids[1:]:
+                if f_i == "s":
+                    continue
             #for i, frame_id in enumerate(self.opt.frame_ids[1:]):
                 for scale in self.opt.scales:
                     outputs[("bh",scale, f_i)] = F.interpolate(outputs["b_"+str(scale)+"_"+str(f_i)], [self.opt.height, self.opt.width], mode="bilinear", align_corners=False)
@@ -414,10 +500,10 @@ class Trainer_Monodepth:
         """
         self.set_eval()
         try:
-            inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
         except StopIteration:
             self.val_iter = iter(self.val_loader)
-            inputs = self.val_iter.next()
+            inputs = next(self.val_iter)
 
         with torch.no_grad():
             outputs, losses = self.process_batch(inputs)
@@ -478,8 +564,13 @@ class Trainer_Monodepth:
                     inputs[("color", frame_id, source_scale)],
                     outputs[("sample", frame_id, scale)],
                     padding_mode="border",align_corners=True)
-
-                outputs[("color_refined", frame_id, scale)] = outputs[("ch",scale, frame_id)] * outputs[("color", frame_id, scale)] + outputs[("bh", scale, frame_id)]
+                if ("ch", scale, frame_id) in outputs and ("bh", scale, frame_id) in outputs:
+                    outputs[("color_refined", frame_id, scale)] = (
+                        outputs[("ch", scale, frame_id)] * outputs[("color", frame_id, scale)] +
+                        outputs[("bh", scale, frame_id)]
+                    )
+                else:
+                    outputs[("color_refined", frame_id, scale)] = outputs[("color", frame_id, scale)]
 
 
 
@@ -547,13 +638,13 @@ class Trainer_Monodepth:
     def compute_losses(self, inputs, outputs):
 
         losses = {}
-        loss_reprojection = 0
-        loss_ilumination_invariant = 0
         total_loss = 0
-
 
         for scale in self.opt.scales:
             loss = 0
+            loss_reprojection = 0
+            loss_ilumination_invariant = 0
+            num_sources = 0
 
             if self.opt.v1_multiscale:
                 source_scale = scale
@@ -564,6 +655,8 @@ class Trainer_Monodepth:
             color = inputs[("color", 0, scale)]
             #Losses & compute mask
             for frame_id in self.opt.frame_ids[1:]:
+                if frame_id == "s":
+                    continue
                 # Mask
                 target = inputs[("color", 0, 0)]
                 pred = outputs[("color", frame_id, scale)]                
@@ -573,23 +666,30 @@ class Trainer_Monodepth:
                 pred = inputs[("color", frame_id, source_scale)]
                 rep_identity = self.compute_reprojection_loss(pred, target)
                 
-                reprojection_loss_mask = self.compute_loss_masks(rep,rep_identity,target)
+                reprojection_loss_mask = self.compute_loss_masks(rep, rep_identity)
                 reprojection_loss_mask_iil = get_feature_oclution_mask(reprojection_loss_mask)
                 #Losses
                 #target = outputs[("color_refined", frame_id, scale)] #Lighting
                 pred = outputs[("color_refined", frame_id, scale)]
                 #SIMM
-                loss_reprojection += (self.compute_reprojection_loss(pred, target) * reprojection_loss_mask).sum() / reprojection_loss_mask.sum()
+                rep_den = reprojection_loss_mask.sum().clamp(min=1.0)
+                loss_reprojection += (
+                    self.compute_reprojection_loss(pred, target) * reprojection_loss_mask
+                ).sum() / rep_den
                 #Multiscale SIMM
                 #loss_reprojection += (self.get_ms_simm_loss(pred, target) * reprojection_loss_mask).sum() / reprojection_loss_mask.sum()
                 #Illuminations invariant loss
                 target = inputs[("color", 0, 0)]
                 pred = outputs[("color_refined", frame_id, scale)]
-                loss_ilumination_invariant += (self.get_ilumination_invariant_loss(pred,target) * reprojection_loss_mask_iil).sum() / reprojection_loss_mask_iil.sum()
- 
-            
-            loss += loss_reprojection / 2.0
-            loss += self.opt.illumination_invariant * loss_ilumination_invariant / 2.0
+                iil_den = reprojection_loss_mask_iil.sum().clamp(min=1.0)
+                loss_ilumination_invariant += (
+                    self.get_ilumination_invariant_loss(pred, target) * reprojection_loss_mask_iil
+                ).sum() / iil_den
+                num_sources += 1
+
+            normalizer = float(max(1, num_sources))
+            loss += loss_reprojection / normalizer
+            loss += self.opt.illumination_invariant * loss_ilumination_invariant / normalizer
             mean_disp = disp.mean(2, True).mean(3, True)
             norm_disp = disp / (mean_disp + 1e-7)
             smooth_loss = get_smooth_loss(norm_disp, color)
@@ -605,7 +705,7 @@ class Trainer_Monodepth:
     
 
     @staticmethod
-    def compute_loss_masks(reprojection_loss, identity_reprojection_loss, inputs):
+    def compute_loss_masks(reprojection_loss, identity_reprojection_loss):
         """ Compute loss masks for each of standard reprojection and depth hint
         reprojection"""
 

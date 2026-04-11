@@ -13,8 +13,11 @@ from options import MonodepthOptions
 import datasets
 import networks
 
-print("GPU ID:", torch.cuda.current_device())
-print("GPU Name:", torch.cuda.get_device_name(0))
+if torch.cuda.is_available():
+    print("GPU ID:", torch.cuda.current_device())
+    print("GPU Name:", torch.cuda.get_device_name(0))
+else:
+    print("CUDA is not available. Training will run on CPU.")
 
 
 def seed_all(seed):

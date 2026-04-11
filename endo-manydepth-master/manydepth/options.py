@@ -19,6 +19,10 @@ class MonodepthOptions:
                                  type=str,
                                  help="path to the training data",
                                  default=os.path.join(file_dir, "kitti_data"))
+        self.parser.add_argument("--split_root",
+                                 type=str,
+                                 default="",
+                                 help="optional root folder for split files")
         self.parser.add_argument("--log_dir",
                                  type=str,
                                  help="log directory",
@@ -48,7 +52,8 @@ class MonodepthOptions:
                                  type=str,
                                  help="which training split to use",
                                  choices=["eigen_zhou", "eigen_full", "odom", "benchmark",
-                                          "cityscapes_preprocessed","endovis","RNNSLAM","colon10k","hamlyn","C3VD"],
+                                          "cityscapes_preprocessed", "endovis", "RNNSLAM",
+                                          "colon10k", "hamlyn", "C3VD", "c3vd"],
                                  default="endovis")
         self.parser.add_argument("--num_layers",
                                  type=int,
@@ -70,7 +75,12 @@ class MonodepthOptions:
                                  help="dataset to train on",
                                  default="kitti",
                                  choices=["kitti", "kitti_odom", "kitti_depth", "kitti_test",
-                                          "cityscapes_preprocessed","endovis","RNNSLAM","colon10k","C3VD", "hamlyn"])
+                                          "cityscapes_preprocessed", "endovis", "RNNSLAM",
+                                          "colon10k", "C3VD", "c3vd", "hamlyn"])
+        self.parser.add_argument("--c3vd_intrinsics_file",
+                                 type=str,
+                                 default="",
+                                 help="optional intrinsics file for C3VD")
         self.parser.add_argument("--png",
                                  help="if set, trains from raw KITTI png files (instead of jpgs)",
                                  action="store_true")
@@ -240,6 +250,23 @@ class MonodepthOptions:
         self.parser.add_argument("--save_intermediate_models",
                                  help="if set, save the model each time we log to tensorboard",
                                  action='store_true')
+        self.parser.add_argument("--wandb_project",
+                                 type=str,
+                                 default="",
+                                 help="optional W&B project name override")
+        self.parser.add_argument("--wandb_entity",
+                                 type=str,
+                                 default="",
+                                 help="optional W&B entity override")
+        self.parser.add_argument("--wandb_mode",
+                                 type=str,
+                                 default="",
+                                 choices=["", "online", "offline", "disabled"],
+                                 help="optional W&B mode override")
+        self.parser.add_argument("--wandb_run_name",
+                                 type=str,
+                                 default="",
+                                 help="optional W&B run name (defaults to model_name)")
 
         # EVALUATION options
         self.parser.add_argument("--eval_stereo",
@@ -262,8 +289,17 @@ class MonodepthOptions:
                                  type=str,
                                  default="SERV-CT",
                                  choices=["eigen", "eigen_benchmark", "benchmark", "odom_9",
-                                          "odom_10", "cityscapes","endovis","RNNSLAM","colon10k","hamlyn","SERV-CT"],
-                                 help="which split to run eval on")
+                                          "odom_10", "cityscapes", "endovis", "RNNSLAM",
+                                          "colon10k", "hamlyn", "SERV-CT", "C3VD", "c3vd"],
+                                  help="which split to run eval on")
+        self.parser.add_argument("--c3vd_eval_min_depth",
+                                 type=float,
+                                 default=0.1,
+                                 help="minimum depth used in C3VD evaluation masking")
+        self.parser.add_argument("--c3vd_eval_max_depth",
+                                 type=float,
+                                 default=100.0,
+                                 help="maximum depth used in C3VD evaluation masking")
         self.parser.add_argument("--save_pred_disps",
                                  help="if set saves predicted disparities",
                                  action="store_true")
@@ -295,4 +331,9 @@ class MonodepthOptions:
 
     def parse(self):
         self.options = self.parser.parse_args()
+        aliases = {"C3VD": "c3vd"}
+        for key in ("dataset", "split", "eval_split"):
+            value = getattr(self.options, key, None)
+            if isinstance(value, str) and value in aliases:
+                setattr(self.options, key, aliases[value])
         return self.options

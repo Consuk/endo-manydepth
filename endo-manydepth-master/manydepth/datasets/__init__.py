@@ -1,30 +1,34 @@
 # flake8: noqa: F401
-from .kitti_dataset import KITTIRAWDataset, KITTIOdomDataset, KITTIDepthDataset
-from .cityscapes_preprocessed_dataset import CityscapesPreprocessedDataset
+
 from .cityscapes_evaldataset import CityscapesEvalDataset
-from .scared_dataset import SCAREDDataset
-from .scared_dataset import SCAREDRAWDataset
-from .kitti_dataset import KITTIRAWDataset, KITTIOdomDataset, KITTIDepthDataset
-from .scared_dataset import SCAREDDataset
-from .scared_dataset import SCAREDRAWDataset
-
-"""
-Expose dataset classes at the package level for convenience.
-
-By importing the dataset classes here, users can do::
-
-    from yourpackage import SCAREDRAWDataset, HamlynDataset
-
-without needing to know the underlying file structure.  Adding
-additional datasets in this file makes them available from the top level.
-"""
-
-# Import datasets so they are available at the package root.  When
-# adding new datasets, import them here and update ``__all__`` below.
-from .scared_dataset import SCAREDRAWDataset
+from .cityscapes_preprocessed_dataset import CityscapesPreprocessedDataset
 from .hamlyn_dataset import HamlynDataset
+from .kitti_dataset import KITTIDepthDataset, KITTIOdomDataset, KITTIRAWDataset
+from .scared_dataset import SCAREDDataset, SCAREDRAWDataset
+
+try:
+    from .c3vd_dataset import C3VDDataset
+except Exception:
+    C3VDDataset = None
+
+
+__all__ = [
+    "KITTIRAWDataset",
+    "KITTIOdomDataset",
+    "KITTIDepthDataset",
+    "CityscapesPreprocessedDataset",
+    "CityscapesEvalDataset",
+    "SCAREDDataset",
+    "SCAREDRAWDataset",
+    "HamlynDataset",
+    "C3VDDataset",
+]
+
 
 dataset_dict = {
     "endovis": SCAREDRAWDataset,
-    "hamlyn": HamlynDataset
+    "hamlyn": HamlynDataset,
 }
+
+if C3VDDataset is not None:
+    dataset_dict["c3vd"] = C3VDDataset

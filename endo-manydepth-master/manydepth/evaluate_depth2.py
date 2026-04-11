@@ -7,8 +7,9 @@ import torch.nn.functional as F
 import cv2
 
 from options import MonodepthOptions
+from utils import resolve_split_dir
+import datasets
 
-import argparse
 import networks
 
 def readlines(p):
@@ -22,8 +23,9 @@ def disp_to_depth(disp, min_depth, max_depth):
     depth = 1.0 / scaled
     return scaled, depth
 
-def compute_depth_errors(gt, pred):
-    mask = gt > 0
+def compute_depth_errors(gt, pred, mask=None):
+    if mask is None:
+        mask = gt > 0
     if not np.any(mask):
         return None
     gt = gt[mask]
@@ -122,12 +124,22 @@ def main():
     # Ahora crea MonodepthOptions y parsea SOLO los args restantes
     options = MonodepthOptions()
     opt = options.parser.parse_args(remaining)
+    aliases = {"C3VD": "c3vd"}
+    for key in ("dataset", "split", "eval_split"):
+        value = getattr(opt, key, None)
+        if isinstance(value, str) and value in aliases:
+            setattr(opt, key, aliases[value])
 
     device = torch.device("cuda" if torch.cuda.is_available() and not opt.no_cuda else "cpu")
 
     # Archivos del split
-    split_dir = os.path.join(os.path.dirname(__file__), "splits", opt.eval_split)
-    list_name = "test_files.txt" if os.path.isfile(os.path.join(split_dir, "test_files.txt")) else "val_files.txt"
+    split_dir = resolve_split_dir(opt.eval_split, getattr(opt, "split_root", ""), os.path.dirname(__file__))
+    if os.path.isfile(os.path.join(split_dir, "test_files.txt")):
+        list_name = "test_files.txt"
+    elif os.path.isfile(os.path.join(split_dir, "val_files.txt")):
+        list_name = "val_files.txt"
+    else:
+        list_name = "validation_files.txt"
     filenames = readlines(os.path.join(split_dir, list_name))
     N = len(filenames)
 
@@ -149,8 +161,30 @@ def main():
         print("-> Loading model from:", opt.load_weights_folder)
         enc, dec, feed_h, feed_w = load_model(opt, device, encoder_type=pre_args.encoder_type)
 
-        from datasets import SCAREDDataset
-        ds = SCAREDDataset(opt.data_path, filenames, feed_h, feed_w, [0], 4, is_train=False)
+        eval_dataset_key = opt.dataset.lower()
+        if eval_dataset_key == "c3vd" or opt.eval_split.lower() == "c3vd":
+            ds = datasets.C3VDDataset(
+                opt.data_path,
+                filenames,
+                feed_h,
+                feed_w,
+                [0],
+                4,
+                is_train=False,
+                img_ext=".png",
+                intrinsics_file=(opt.c3vd_intrinsics_file or None),
+            )
+        else:
+            ds = datasets.SCAREDDataset(
+                opt.data_path,
+                filenames,
+                feed_h,
+                feed_w,
+                [0],
+                4,
+                is_train=False,
+                img_ext=".png" if opt.png else ".jpg",
+            )
         preds = []
         with torch.no_grad():
             for i in range(N):
@@ -170,12 +204,15 @@ def main():
 
     accum = np.zeros(7, dtype=np.float64)
     evaluated = 0
+    eval_c3vd = (opt.dataset.lower() == "c3vd") or (opt.eval_split.lower() == "c3vd")
+    eval_min_depth = opt.c3vd_eval_min_depth if eval_c3vd else opt.min_depth
+    eval_max_depth = opt.c3vd_eval_max_depth if eval_c3vd else opt.max_depth
 
     for i in range(M):
         disp = pred_disps[i]
         # Pasamos disp -> depth
         disp_t = torch.from_numpy(disp).unsqueeze(0).unsqueeze(0)
-        _, depth_pred_t = disp_to_depth(disp_t, opt.min_depth, opt.max_depth)
+        _, depth_pred_t = disp_to_depth(disp_t, eval_min_depth, eval_max_depth)
         depth_pred = depth_pred_t.squeeze().numpy()
 
         depth_gt = gt_depths[i]
@@ -185,15 +222,15 @@ def main():
             depth_pred = cv2.resize(depth_pred, (depth_gt.shape[1], depth_gt.shape[0]), interpolation=cv2.INTER_LINEAR)
 
         # Median scaling (si aplica)
-        valid = depth_gt > 0
+        valid = np.logical_and(depth_gt > eval_min_depth, depth_gt < eval_max_depth)
         if np.any(valid) and (not opt.disable_median_scaling) and (not opt.eval_stereo):
             scale = np.median(depth_gt[valid]) / (np.median(depth_pred[valid]) + 1e-6)
             depth_pred = depth_pred * scale
 
         # Clamps por seguridad
-        depth_pred = np.clip(depth_pred, opt.min_depth, opt.max_depth)
+        depth_pred = np.clip(depth_pred, eval_min_depth, eval_max_depth)
 
-        metrics = compute_depth_errors(depth_gt, depth_pred)
+        metrics = compute_depth_errors(depth_gt, depth_pred, mask=valid)
         if metrics is None:
             continue
 
