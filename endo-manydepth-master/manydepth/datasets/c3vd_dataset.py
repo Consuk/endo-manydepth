@@ -36,12 +36,11 @@ class C3VDDataset(MonoDataset):
             [0.0, 0.0, 0.0, 1.0],
         ], dtype=np.float32)
 
-        self.intrinsics_file = intrinsics_file
-        self._intrinsics_map = self._load_intrinsics_map(intrinsics_file)
+        self.intrinsics_file = os.path.expanduser(intrinsics_file) if intrinsics_file else None
+        self._intrinsics_map = self._load_intrinsics_map(self.intrinsics_file)
         self._frame_cache = {}
         self._intrinsics_cache = {}
         self._image_size_cache = {}
-        self._global_intrinsics_cache = None
 
     def check_depth(self):
         return False
@@ -86,6 +85,16 @@ class C3VDDataset(MonoDataset):
         if map_intrinsics is not None:
             self._intrinsics_cache[norm_folder] = map_intrinsics
             return map_intrinsics.copy()
+
+        # Priority A.1: explicit direct file passed via --c3vd_intrinsics_file
+        direct_intrinsics = self._load_intrinsics_from_candidates(
+            self._direct_intrinsics_candidates(),
+            norm_folder,
+            frame_index,
+        )
+        if direct_intrinsics is not None:
+            self._intrinsics_cache[norm_folder] = direct_intrinsics
+            return direct_intrinsics.copy()
 
         # Priority B: per-sequence intrinsics files inside each sequence folder
         seq_intrinsics = self._load_intrinsics_from_candidates(
@@ -291,9 +300,11 @@ class C3VDDataset(MonoDataset):
         return None
 
     def _sequence_intrinsics_candidates(self, folder):
-        names = ("intrinsics.txt", "camera_intrinsics.txt", "intrinsics.npy")
+        names = ("intrinsics.txt", "camera_intrinsics.txt", "intrinsics.npy", "intrinsics.npz")
         paths = []
         seen = set()
+        folder_norm = folder.replace("\\", "/").strip("/")
+        folder_root = folder_norm.split("/")[0] if folder_norm else ""
 
         for root in self._candidate_roots(folder):
             for name in names:
@@ -302,10 +313,23 @@ class C3VDDataset(MonoDataset):
                     paths.append(p)
                     seen.add(p)
 
+        # Optional intermediate fallback such as data_path/train/intrinsics.txt
+        if folder_root:
+            for name in names:
+                p = os.path.normpath(os.path.join(self.data_path, folder_root, name))
+                if p not in seen:
+                    paths.append(p)
+                    seen.add(p)
+
         return paths
 
+    def _direct_intrinsics_candidates(self):
+        if not self.intrinsics_file:
+            return []
+        return [self.intrinsics_file]
+
     def _global_intrinsics_candidates(self):
-        names = ("intrinsics.txt", "camera_intrinsics.txt", "intrinsics.npy")
+        names = ("intrinsics.txt", "camera_intrinsics.txt", "intrinsics.npy", "intrinsics.npz")
         roots = [
             self.data_path,
             os.path.join(self.data_path, "camera"),
@@ -323,20 +347,9 @@ class C3VDDataset(MonoDataset):
         return paths
 
     def _load_global_intrinsics(self, folder, frame_index):
-        if isinstance(self._global_intrinsics_cache, np.ndarray):
-            return self._global_intrinsics_cache.copy()
-        if self._global_intrinsics_cache is False:
-            return None
-
-        intrinsics = self._load_intrinsics_from_candidates(
+        return self._load_intrinsics_from_candidates(
             self._global_intrinsics_candidates(), folder, frame_index
         )
-        if intrinsics is not None:
-            self._global_intrinsics_cache = intrinsics.copy()
-            return intrinsics
-
-        self._global_intrinsics_cache = False
-        return None
 
     def _load_intrinsics_from_candidates(self, candidates, folder, frame_index):
         for path in candidates:
@@ -353,9 +366,13 @@ class C3VDDataset(MonoDataset):
         _, ext = os.path.splitext(path)
         ext = ext.lower()
 
-        if ext == ".npy":
+        if ext in (".npy", ".npz"):
             try:
                 matrix = np.load(path)
+                if isinstance(matrix, np.lib.npyio.NpzFile):
+                    if not matrix.files:
+                        return None
+                    matrix = matrix[matrix.files[0]]
             except Exception:
                 return None
             return self._finalize_intrinsics_matrix(matrix, folder, frame_index)
