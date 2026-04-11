@@ -81,6 +81,17 @@ class MonodepthOptions:
                                  type=str,
                                  default="",
                                  help="optional intrinsics file for C3VD")
+        self.parser.add_argument("--c3vd_use_loss_mask",
+                                 action="store_true",
+                                 help="if set, uses C3VD valid-region mask to weight photometric losses")
+        self.parser.add_argument("--c3vd_mask_filename",
+                                 type=str,
+                                 default="mask.png",
+                                 help="mask filename searched per C3VD sequence when --c3vd_use_loss_mask is set")
+        self.parser.add_argument("--c3vd_mask_erosion",
+                                 type=int,
+                                 default=0,
+                                 help="optional erosion iterations for C3VD mask (requires cv2)")
         self.parser.add_argument("--png",
                                  help="if set, trains from raw KITTI png files (instead of jpgs)",
                                  action="store_true")
