@@ -1,5 +1,6 @@
 from __future__ import absolute_import, division, print_function
 
+import argparse
 import os
 import cv2
 import numpy as np
@@ -8,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from layers import disp_to_depth
-from utils import readlines
+from utils import readlines, resolve_split_dir
 from options import MonodepthOptions
 import datasets
 import networks
@@ -31,6 +32,32 @@ splits_dir = os.path.join(os.path.dirname(__file__), "splits")
 # baseline of 0.1 units. The KITTI rig has a baseline of 54cm. Therefore,
 # to convert our stereo predictions to real-world scale we multiply our depths by 5.4.
 STEREO_SCALE_FACTOR = 5.4
+
+
+def _resolve_split_file(split_dir, names):
+    for name in names:
+        path = os.path.join(split_dir, "{}_files.txt".format(name))
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        "Could not find split file in '{}' for any of {}".format(split_dir, names)
+    )
+
+
+def _is_c3vd_eval(opt):
+    dataset_key = str(getattr(opt, "dataset", "")).lower()
+    eval_key = str(getattr(opt, "eval_split", "")).lower()
+    return dataset_key == "c3vd" or eval_key == "c3vd"
+
+
+def _load_state_intersection(model, checkpoint):
+    model_dict = model.state_dict()
+    checkpoint = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+    subset = {k: v for k, v in checkpoint.items() if k in model_dict}
+    if not subset:
+        raise RuntimeError("No matching keys were found when loading model weights.")
+    model_dict.update(subset)
+    model.load_state_dict(model_dict, strict=False)
 
 def disp_to_depth(disp, min_depth, max_depth):
     """Convert network's sigmoid output into depth prediction
@@ -80,17 +107,32 @@ def build_eval_dataset(opt, filenames):
     - For Hamlyn: use HamlynDataset (custom class).
     - Otherwise: fall back to SCAREDRAWDataset (or whatever you were using).
     """
-    HEIGHT, WIDTH = 256, 320   # or opt.height / opt.width if you prefer
-    img_ext = '.png' if opt.png else '.jpg'
+    HEIGHT, WIDTH = opt.height, opt.width
+    dataset_key = str(getattr(opt, "dataset", "")).lower()
+    eval_key = str(getattr(opt, "eval_split", "")).lower()
 
     # --- Hamlyn-specific path ---
-    if opt.eval_split == "hamlyn":
+    if eval_key == "hamlyn":
         DatasetClass = datasets.HamlynDataset
         print("-> Using HamlynDataset for evaluation")
+        img_ext = '.png' if opt.png else '.jpg'
+        kwargs = {}
+    elif _is_c3vd_eval(opt):
+        DatasetClass = datasets.C3VDDataset
+        if DatasetClass is None:
+            raise ImportError("C3VDDataset is not available in datasets package.")
+        print("-> Using C3VDDataset for evaluation")
+        img_ext = '.png'
+        kwargs = {}
+        intrinsics_file = getattr(opt, "c3vd_intrinsics_file", "")
+        if intrinsics_file:
+            kwargs["intrinsics_file"] = intrinsics_file
     else:
         # Default / legacy behaviour (SCARED, etc.)
         DatasetClass = datasets.SCAREDRAWDataset
         print("-> Using SCAREDRAWDataset for evaluation (eval_split = {})".format(opt.eval_split))
+        img_ext = '.png' if opt.png else '.jpg'
+        kwargs = {}
 
     dataset = DatasetClass(
         opt.data_path,
@@ -100,24 +142,30 @@ def build_eval_dataset(opt, filenames):
         [0],          # frame_idxs: only current frame
         4,            # num_scales
         is_train=False,
-        img_ext=img_ext
+        img_ext=img_ext,
+        **kwargs
     )
 
     return dataset
 
-def evaluate(opt):
+def evaluate(opt, encoder_type="monovit", gt_npz=None):
     """Evaluates a pretrained model using a specified test set
     """
-    # Use the user-specified depth bounds from the options for thresholding.
-    # These values control the minimum and maximum depths that are considered
-    # valid when computing error metrics.  Previously these were fixed to
-    # 1e-3 and 150, but for Hamlyn evaluation we allow them to be passed via
-    # ``--min_depth`` and ``--max_depth`` (e.g. 1 and 50).
-    MIN_DEPTH = opt.min_depth
-    MAX_DEPTH = opt.max_depth
+    if _is_c3vd_eval(opt):
+        MIN_DEPTH = getattr(opt, "c3vd_eval_min_depth", opt.min_depth)
+        MAX_DEPTH = getattr(opt, "c3vd_eval_max_depth", opt.max_depth)
+    else:
+        # Use the user-specified depth bounds from the options for thresholding.
+        MIN_DEPTH = opt.min_depth
+        MAX_DEPTH = opt.max_depth
 
     assert sum((opt.eval_mono, opt.eval_stereo)) == 1, \
         "Please choose mono or stereo evaluation by setting either --eval_mono or --eval_stereo"
+
+    split_dir = resolve_split_dir(
+        opt.eval_split, getattr(opt, "split_root", ""), os.path.dirname(__file__)
+    )
+    split_file = _resolve_split_file(split_dir, ("test", "val", "validation"))
 
     if opt.ext_disp_to_eval is None:
 
@@ -128,11 +176,12 @@ def evaluate(opt):
 
         print("-> Loading weights from {}".format(opt.load_weights_folder))
 
-        filenames = readlines(os.path.join(splits_dir, opt.eval_split, "test_files.txt"))
+        filenames = readlines(split_file)
         encoder_path = os.path.join(opt.load_weights_folder, "encoder.pth")
         decoder_path = os.path.join(opt.load_weights_folder, "depth.pth")
 
-        encoder_dict = torch.load(encoder_path)
+        encoder_dict = torch.load(encoder_path, map_location="cpu")
+        decoder_dict = torch.load(decoder_path, map_location="cpu")
 
         """dataset = datasets.KITTIRAWDataset(opt.data_path, filenames,
                                            encoder_dict['height'], encoder_dict['width'],
@@ -151,18 +200,20 @@ def evaluate(opt):
             drop_last=False
         )
 
-        encoder = networks.mpvit_small() #networks.ResnetEncoder(opt.num_layers, False)
-        encoder.num_ch_enc = [64,128,216,288,288]  # = networks.ResnetEncoder(opt.num_layers, False)
-        depth_decoder = networks.DepthDecoderT()
+        if encoder_type == "resnet":
+            encoder = networks.ResnetEncoder(opt.num_layers, False)
+            depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(4))
+        else:
+            encoder = networks.mpvit_small()
+            encoder.num_ch_enc = [64, 128, 216, 288, 288]
+            depth_decoder = networks.DepthDecoderT()
 
-        model_dict = encoder.state_dict()
-        encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
-        depth_decoder.load_state_dict(torch.load(decoder_path))
+        _load_state_intersection(encoder, encoder_dict)
+        _load_state_intersection(depth_decoder, decoder_dict)
 
-        encoder.cuda()
-        encoder.eval()
-        depth_decoder.cuda()
-        depth_decoder.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() and not opt.no_cuda else "cpu")
+        encoder.to(device).eval()
+        depth_decoder.to(device).eval()
 
         pred_disps = []
 
@@ -171,7 +222,7 @@ def evaluate(opt):
 
         with torch.no_grad():
             for data in dataloader:
-                input_color = data[("color", 0, 0)].cuda()
+                input_color = data[("color", 0, 0)].to(device)
 
                 if opt.post_process:
                     # Post-processed results require each image to have two forward passes
@@ -179,7 +230,7 @@ def evaluate(opt):
 
                 output = depth_decoder(encoder(input_color))
 
-                pred_disp, _ = disp_to_depth(output[("disp", 0)], opt.min_depth, opt.max_depth)
+                pred_disp, _ = disp_to_depth(output[("disp", 0)], MIN_DEPTH, MAX_DEPTH)
                 pred_disp = pred_disp.cpu()[:, 0].numpy()
 
                 """
@@ -229,7 +280,9 @@ def evaluate(opt):
         print("-> No ground truth is available for the KITTI benchmark, so not evaluating. Done.")
         quit()"""
 
-    gt_path = os.path.join(splits_dir, opt.eval_split, "gt_depths.npz")
+    gt_path = gt_npz if gt_npz else os.path.join(split_dir, "gt_depths.npz")
+    if not os.path.isfile(gt_path):
+        raise FileNotFoundError("Ground-truth npz not found at '{}'".format(gt_path))
     data_npz = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)
     gt_depths = data_npz["data"]
 
@@ -352,5 +405,28 @@ def colormap(inputs, normalize=True, torch_transpose=True):
         return vis
 
 if __name__ == "__main__":
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument(
+        "--encoder_type",
+        type=str,
+        default="monovit",
+        choices=["resnet", "monovit"],
+        help="encoder type used for evaluation model construction",
+    )
+    pre_parser.add_argument(
+        "--gt_npz",
+        type=str,
+        default=None,
+        help="optional path to gt_depths.npz (overrides split default)",
+    )
+    pre_args, remaining = pre_parser.parse_known_args()
+
     options = MonodepthOptions()
-    evaluate(options.parse())
+    opt = options.parser.parse_args(remaining)
+    aliases = {"C3VD": "c3vd"}
+    for key in ("dataset", "split", "eval_split"):
+        value = getattr(opt, key, None)
+        if isinstance(value, str) and value in aliases:
+            setattr(opt, key, aliases[value])
+
+    evaluate(opt, encoder_type=pre_args.encoder_type, gt_npz=pre_args.gt_npz)
