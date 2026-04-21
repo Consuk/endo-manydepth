@@ -189,17 +189,22 @@ def _score_c3vd_root(base_root, filenames, max_checks=30):
 
 def resolve_data_root(corr_dir, severity, split_name, filenames):
     if _is_c3vd_split(split_name):
-        candidates = [
-            os.path.join(corr_dir, severity),
-            os.path.join(corr_dir, severity, "test"),
-            os.path.join(corr_dir, severity, "endovis_data"),
-        ]
-        scored = [(p, _score_c3vd_root(p, filenames)) for p in candidates]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        best_path, best_score = scored[0]
-        if best_score >= 0:
-            return best_path
-        return candidates[0]
+        # Prefer the known C3VD corruption layout first.
+        preferred = os.path.join(corr_dir, severity, "test")
+        if os.path.isdir(preferred):
+            return preferred
+
+        # Fallbacks for alternative local layouts.
+        direct = os.path.join(corr_dir, severity)
+        if os.path.isdir(direct):
+            return direct
+
+        legacy = os.path.join(corr_dir, severity, "endovis_data")
+        if os.path.isdir(legacy):
+            return legacy
+
+        # Last resort keeps a deterministic path for warning messages.
+        return preferred
 
     # Legacy EndoVIS layout
     return os.path.join(corr_dir, severity, "endovis_data")
