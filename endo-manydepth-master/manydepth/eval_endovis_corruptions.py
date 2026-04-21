@@ -7,6 +7,10 @@ import numpy as np
 import cv2
 from collections import defaultdict
 from datasets import SCAREDRAWDataset
+try:
+    from datasets import C3VDDataset
+except Exception:
+    C3VDDataset = None
 
 import torch
 from torch.utils.data import DataLoader
@@ -137,8 +141,72 @@ def map_split_to_existing_paths(data_path_root, filenames, png=False, strict=Fal
 
     return idx_keep, real_paths, missing
 
+
+def _is_c3vd_split(split_name):
+    return str(split_name).lower() == "c3vd"
+
+
+def _parse_c3vd_split_line(line):
+    parts = line.strip().split()
+    if len(parts) < 2:
+        return None, None
+    folder = parts[0]
+    try:
+        frame_idx = int(parts[1])
+    except Exception:
+        return None, None
+    return folder, frame_idx
+
+
+def _score_c3vd_root(base_root, filenames, max_checks=30):
+    if not os.path.isdir(base_root):
+        return -1
+
+    score = 0
+    checks = 0
+    for line in filenames:
+        folder, frame_idx = _parse_c3vd_split_line(line)
+        if folder is None:
+            continue
+        checks += 1
+        if checks > max_checks:
+            break
+
+        seq_root = os.path.join(base_root, folder)
+        candidates = [
+            os.path.join(seq_root, f"{frame_idx:04d}_color.png"),
+            os.path.join(seq_root, f"{frame_idx:05d}_color.png"),
+            os.path.join(seq_root, f"{frame_idx:06d}_color.png"),
+            os.path.join(seq_root, f"{frame_idx}_color.png"),
+            os.path.join(seq_root, f"{frame_idx:04d}.png"),
+            os.path.join(seq_root, f"{frame_idx}.png"),
+        ]
+        if any(os.path.isfile(p) for p in candidates):
+            score += 1
+
+    return score
+
+
+def resolve_data_root(corr_dir, severity, split_name, filenames):
+    if _is_c3vd_split(split_name):
+        candidates = [
+            os.path.join(corr_dir, severity),
+            os.path.join(corr_dir, severity, "test"),
+            os.path.join(corr_dir, severity, "endovis_data"),
+        ]
+        scored = [(p, _score_c3vd_root(p, filenames)) for p in candidates]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        best_path, best_score = scored[0]
+        if best_score >= 0:
+            return best_path
+        return candidates[0]
+
+    # Legacy EndoVIS layout
+    return os.path.join(corr_dir, severity, "endovis_data")
+
 def evaluate_one_root(data_path_root,
                       filenames,
+                      split_name,
                       gt_depths,
                       encoder,
                       depth_decoder,
@@ -158,15 +226,23 @@ def evaluate_one_root(data_path_root,
     - strict=True  -> exige que TODAS las entradas del split carguen; de lo contrario lanza.
     - strict=False -> procesa sólo las que se puedan cargar (lenient).
     """
-    # 1) construir dataset con el parser original
-    img_ext = '.png' if png else '.jpg'
+    split_key = str(split_name).lower()
+    img_ext = '.png' if (png or split_key == "c3vd") else '.jpg'
     try:
-        dataset = SCAREDRAWDataset(
-            data_path_root, filenames, height, width,
-            [0], 4, is_train=False, img_ext=img_ext
-        )
+        if split_key == "c3vd":
+            if C3VDDataset is None:
+                raise RuntimeError("C3VDDataset is not available in this environment.")
+            dataset = C3VDDataset(
+                data_path_root, filenames, height, width,
+                [0], 4, is_train=False, img_ext=img_ext
+            )
+        else:
+            dataset = SCAREDRAWDataset(
+                data_path_root, filenames, height, width,
+                [0], 4, is_train=False, img_ext=img_ext
+            )
     except Exception as e:
-        raise RuntimeError(f"No se pudo inicializar SCAREDRAWDataset en {data_path_root}: {e}")
+        raise RuntimeError(f"No se pudo inicializar dataset en {data_path_root}: {e}")
 
     n = len(filenames)
     kept_indices = []          # índices (del split) que sí se pudieron cargar
@@ -365,7 +441,7 @@ def main():
                             key=lambda s: int(s.split("_")[-1]) if s.split("_")[-1].isdigit() else 9999)
 
         for sev in severities:
-            data_root = os.path.join(corr_dir, sev, "endovis_data")
+            data_root = resolve_data_root(corr_dir, sev, args.split, test_files)
             print(f"\n>> {corr_name} / {sev} :: data_path = {data_root}")
             if not os.path.isdir(data_root):
                 print(f"   [WARN] No existe {data_root}, se omite.")
@@ -375,6 +451,7 @@ def main():
                 mean_errors = evaluate_one_root(
                     data_path_root=data_root,
                     filenames=test_files,
+                    split_name=args.split,
                     gt_depths=gt_depths,
                     encoder=encoder,
                     depth_decoder=depth_decoder,
