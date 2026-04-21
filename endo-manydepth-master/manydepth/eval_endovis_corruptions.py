@@ -305,6 +305,8 @@ def main():
     parser.add_argument("--png", action="store_true", help="Usa .png en lugar de .jpg")
     parser.add_argument("--eval_stereo", action="store_true", help="Forzar estéreo (desactiva median scaling y usa x5.4)")
     parser.add_argument("--output_csv", type=str, default="corruptions_summary.csv")
+    parser.add_argument("--output_csv_monoiit_corruptions", type=str, default="",
+                        help="Alias legacy for --output_csv")
     parser.add_argument("--strict", action="store_true",
                         help="Modo estricto: exige que todas las entradas del split existan en cada severidad.")
     args = parser.parse_args()
@@ -321,9 +323,21 @@ def main():
     gt_path = os.path.join(args.splits_dir, args.split, "gt_depths.npz")
     if not os.path.isfile(gt_path):
         raise FileNotFoundError(f"No se encontró gt_depths.npz en {gt_path}")
-    gt_depths = np.load(gt_path, fix_imports=True, encoding='latin1')["data"]
+    data_npz = np.load(gt_path, fix_imports=True, encoding='latin1', allow_pickle=True)
+    gt_depths = data_npz["data"]
+    if isinstance(gt_depths, list):
+        gt_depths = np.array(gt_depths, dtype=object)
+    elif isinstance(gt_depths, np.ndarray) and gt_depths.dtype == object:
+        # Keep object dtype to support variable-shape GT maps while preserving
+        # advanced indexing with kept_indices.
+        gt_depths = gt_depths
+    else:
+        gt_depths = np.asarray(gt_depths)
 
-    if len(test_files) != gt_depths.shape[0]:
+    if args.output_csv_monoiit_corruptions:
+        args.output_csv = args.output_csv_monoiit_corruptions
+
+    if len(test_files) != len(gt_depths):
         print("[WARN] test_files.txt y gt_depths.npz difieren en longitud. "
               "Esto es típico cuando hay líneas de split inválidas o extra. "
               "El script filtrará por líneas parseables y existentes por severidad.")
