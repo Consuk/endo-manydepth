@@ -158,6 +158,36 @@ def _parse_c3vd_split_line(line):
     return folder, frame_idx
 
 
+def _normalize_c3vd_folder(folder):
+    folder = str(folder).replace("\\", "/").strip("/")
+    if not folder:
+        return folder
+
+    parts = [p for p in folder.split("/") if p]
+    if not parts:
+        return folder
+
+    # Corrupted C3VD roots typically store sequences under:
+    #   <severity>/test/<sequence_name>/
+    # Split files can include prefixes like test/validation/training.
+    # We use only the terminal sequence folder for robust matching.
+    return parts[-1]
+
+
+def _normalize_c3vd_filenames_for_corruptions(filenames):
+    normalized = []
+    for raw in filenames:
+        parts = str(raw).strip().split()
+        if len(parts) < 2:
+            normalized.append(raw)
+            continue
+
+        folder = _normalize_c3vd_folder(parts[0])
+        rebuilt = [folder] + parts[1:]
+        normalized.append(" ".join(rebuilt))
+    return normalized
+
+
 def _score_c3vd_root(base_root, filenames, max_checks=30):
     if not os.path.isdir(base_root):
         return -1
@@ -233,17 +263,20 @@ def evaluate_one_root(data_path_root,
     """
     split_key = str(split_name).lower()
     img_ext = '.png' if (png or split_key == "c3vd") else '.jpg'
+    loader_filenames = filenames
+    if split_key == "c3vd":
+        loader_filenames = _normalize_c3vd_filenames_for_corruptions(filenames)
     try:
         if split_key == "c3vd":
             if C3VDDataset is None:
                 raise RuntimeError("C3VDDataset is not available in this environment.")
             dataset = C3VDDataset(
-                data_path_root, filenames, height, width,
+                data_path_root, loader_filenames, height, width,
                 [0], 4, is_train=False, img_ext=img_ext
             )
         else:
             dataset = SCAREDRAWDataset(
-                data_path_root, filenames, height, width,
+                data_path_root, loader_filenames, height, width,
                 [0], 4, is_train=False, img_ext=img_ext
             )
     except Exception as e:
