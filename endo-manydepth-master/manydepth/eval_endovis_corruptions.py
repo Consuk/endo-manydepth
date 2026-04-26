@@ -28,8 +28,10 @@ except Exception as e:
 
 # ===== Constantes/metas =====
 STEREO_SCALE_FACTOR = 5.4
-MIN_DEPTH = 1e-3
-MAX_DEPTH = 150.0
+DEFAULT_MIN_DEPTH = 1e-3
+DEFAULT_MAX_DEPTH = 150.0
+C3VD_DEFAULT_MIN_DEPTH = 0.1
+C3VD_DEFAULT_MAX_DEPTH = 100.0
 
 def _to_numeric_array(x, dtype=np.float32):
     arr = np.asarray(x)
@@ -159,6 +161,12 @@ def _is_c3vd_split(split_name):
     return str(split_name).lower() == "c3vd"
 
 
+def _resolve_eval_depth_bounds(args):
+    if _is_c3vd_split(args.split):
+        return float(args.c3vd_eval_min_depth), float(args.c3vd_eval_max_depth)
+    return float(args.min_depth), float(args.max_depth)
+
+
 def _parse_c3vd_split_line(line):
     parts = line.strip().split()
     if len(parts) < 2:
@@ -258,6 +266,8 @@ def evaluate_one_root(data_path_root,
                       gt_depths,
                       encoder,
                       depth_decoder,
+                      min_depth=DEFAULT_MIN_DEPTH,
+                      max_depth=DEFAULT_MAX_DEPTH,
                       height=256,
                       width=320,
                       batch_size=16,
@@ -311,7 +321,7 @@ def evaluate_one_root(data_path_root,
             batch = torch.stack(buffer_imgs, dim=0).to(device)  # [B,3,H,W]
             feats = encoder(batch)
             out   = depth_decoder(feats)
-            pred_disp, _ = disp_to_depth(out[("disp", 0)], 1e-3, 80)
+            pred_disp, _ = disp_to_depth(out[("disp", 0)], min_depth, max_depth)
             preds_list.append(pred_disp[:, 0].cpu().numpy())
 
     missing = 0
@@ -375,7 +385,7 @@ def evaluate_one_root(data_path_root,
         pred_depth = 1.0 / (pred_disp + 1e-8)
 
         mask = np.logical_and(np.isfinite(gt_depth), np.isfinite(pred_depth))
-        mask = np.logical_and(mask, np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH))
+        mask = np.logical_and(mask, np.logical_and(gt_depth > min_depth, gt_depth < max_depth))
         pd = _to_numeric_array(pred_depth[mask], dtype=np.float32)
         gd = _to_numeric_array(gt_depth[mask], dtype=np.float32)
         if gd.size == 0 or pd.size == 0:
@@ -389,8 +399,8 @@ def evaluate_one_root(data_path_root,
             ratios.append(ratio)
             pd *= ratio
 
-        pd[pd < MIN_DEPTH] = MIN_DEPTH
-        pd[pd > MAX_DEPTH] = MAX_DEPTH
+        pd[pd < min_depth] = min_depth
+        pd[pd > max_depth] = max_depth
         errors.append(compute_errors(gd, pd))
 
     if len(errors) == 0:
@@ -437,6 +447,14 @@ def main():
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--png", action="store_true", help="Usa .png en lugar de .jpg")
+    parser.add_argument("--min_depth", type=float, default=DEFAULT_MIN_DEPTH,
+                        help="Min depth for non-C3VD evaluation")
+    parser.add_argument("--max_depth", type=float, default=DEFAULT_MAX_DEPTH,
+                        help="Max depth for non-C3VD evaluation")
+    parser.add_argument("--c3vd_eval_min_depth", type=float, default=C3VD_DEFAULT_MIN_DEPTH,
+                        help="Min depth for C3VD evaluation")
+    parser.add_argument("--c3vd_eval_max_depth", type=float, default=C3VD_DEFAULT_MAX_DEPTH,
+                        help="Max depth for C3VD evaluation")
     parser.add_argument("--eval_stereo", action="store_true", help="Forzar estéreo (desactiva median scaling y usa x5.4)")
     parser.add_argument("--output_csv", type=str, default="corruptions_summary.csv")
     parser.add_argument("--output_csv_monoiit_corruptions", type=str, default="",
@@ -479,6 +497,8 @@ def main():
     # Configuración mono/estéreo (coherente con tu evaluación base)
     disable_median_scaling = args.eval_stereo
     pred_depth_scale_factor = STEREO_SCALE_FACTOR if args.eval_stereo else 1.0
+    eval_min_depth, eval_max_depth = _resolve_eval_depth_bounds(args)
+    print(f"-> Depth bounds: min={eval_min_depth}, max={eval_max_depth}")
 
     # Cargar modelo (una sola vez)
     print("-> Cargando pesos:", args.load_weights_folder)
@@ -513,6 +533,8 @@ def main():
                     gt_depths=gt_depths,
                     encoder=encoder,
                     depth_decoder=depth_decoder,
+                    min_depth=eval_min_depth,
+                    max_depth=eval_max_depth,
                     height=args.height,
                     width=args.width,
                     batch_size=args.batch_size,
