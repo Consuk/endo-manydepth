@@ -31,8 +31,21 @@ STEREO_SCALE_FACTOR = 5.4
 MIN_DEPTH = 1e-3
 MAX_DEPTH = 150.0
 
+def _to_numeric_array(x, dtype=np.float32):
+    arr = np.asarray(x)
+    if arr.dtype == object:
+        arr = np.array(arr, dtype=dtype)
+    else:
+        arr = arr.astype(dtype, copy=False)
+    return arr
+
 def compute_errors(gt, pred):
-    """Métricas estándar de Monodepth/EndoDepth."""
+    """Metricas estandar de Monodepth/EndoDepth."""
+    gt = _to_numeric_array(gt, dtype=np.float64).reshape(-1)
+    pred = _to_numeric_array(pred, dtype=np.float64).reshape(-1)
+    gt = np.clip(gt, 1e-8, None)
+    pred = np.clip(pred, 1e-8, None)
+
     thresh = np.maximum((gt / pred), (pred / gt))
     a1 = (thresh < 1.25     ).mean()
     a2 = (thresh < 1.25 ** 2).mean()
@@ -45,7 +58,7 @@ def compute_errors(gt, pred):
     rmse_log = np.sqrt(rmse_log.mean())
 
     abs_rel = np.mean(np.abs(gt - pred) / gt)
-    sq_rel  = np.mean(((gt - pred) ** 2) / gt)
+    sq_rel = np.mean(((gt - pred) ** 2) / gt)
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
 def load_model(load_weights_folder, num_layers, device):
@@ -351,19 +364,22 @@ def evaluate_one_root(data_path_root,
     pred_disps = np.concatenate(preds_list, axis=0)  # [M,H',W'] en disp-normalizada
     sel_gt     = gt_depths[kept_indices]
 
-    # 4) métrica por muestra y promedio, idéntico a tu evaluate base
+    # 4) metrica por muestra y promedio, identico a tu evaluate base
     errors, ratios = [], []
     for i in range(pred_disps.shape[0]):
-        gt_depth = sel_gt[i]
+        gt_depth = _to_numeric_array(sel_gt[i], dtype=np.float32)
         gt_h, gt_w = gt_depth.shape[:2]
 
-        pred_disp = pred_disps[i]
+        pred_disp = _to_numeric_array(pred_disps[i], dtype=np.float32)
         pred_disp = cv2.resize(pred_disp, (gt_w, gt_h))
         pred_depth = 1.0 / (pred_disp + 1e-8)
 
-        mask = np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH)
-        pd = pred_depth[mask]
-        gd = gt_depth[mask]
+        mask = np.logical_and(np.isfinite(gt_depth), np.isfinite(pred_depth))
+        mask = np.logical_and(mask, np.logical_and(gt_depth > MIN_DEPTH, gt_depth < MAX_DEPTH))
+        pd = _to_numeric_array(pred_depth[mask], dtype=np.float32)
+        gd = _to_numeric_array(gt_depth[mask], dtype=np.float32)
+        if gd.size == 0 or pd.size == 0:
+            continue
 
         if pred_depth_scale_factor != 1.0:
             pd *= pred_depth_scale_factor
@@ -375,8 +391,12 @@ def evaluate_one_root(data_path_root,
 
         pd[pd < MIN_DEPTH] = MIN_DEPTH
         pd[pd > MAX_DEPTH] = MAX_DEPTH
-
         errors.append(compute_errors(gd, pd))
+
+    if len(errors) == 0:
+        raise RuntimeError(
+            "No valid depth pixels remained after masking for '{}'".format(data_path_root)
+        )
 
     if not disable_median_scaling and len(ratios) > 0:
         ratios = np.array(ratios)
@@ -542,3 +562,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
