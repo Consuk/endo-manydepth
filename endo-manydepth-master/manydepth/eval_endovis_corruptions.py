@@ -6,7 +6,7 @@ import csv
 import numpy as np
 import cv2
 from collections import defaultdict
-from datasets import SCAREDRAWDataset
+from datasets import SCAREDRAWDataset, HamlynDataset
 try:
     from datasets import C3VDDataset
 except Exception:
@@ -161,6 +161,10 @@ def _is_c3vd_split(split_name):
     return str(split_name).lower() == "c3vd"
 
 
+def _is_hamlyn_split(split_name):
+    return str(split_name).lower() == "hamlyn"
+
+
 def _resolve_eval_depth_bounds(args):
     if _is_c3vd_split(args.split):
         return float(args.c3vd_eval_min_depth), float(args.c3vd_eval_max_depth)
@@ -257,6 +261,17 @@ def resolve_data_root(corr_dir, severity, split_name, filenames):
         # Last resort keeps a deterministic path for warning messages.
         return preferred
 
+    if _is_hamlyn_split(split_name):
+        direct = os.path.join(corr_dir, severity)
+        if os.path.isdir(direct):
+            return direct
+
+        legacy = os.path.join(corr_dir, severity, "endovis_data")
+        if os.path.isdir(legacy):
+            return legacy
+
+        return direct
+
     # Legacy EndoVIS layout
     return os.path.join(corr_dir, severity, "endovis_data")
 
@@ -294,6 +309,11 @@ def evaluate_one_root(data_path_root,
             if C3VDDataset is None:
                 raise RuntimeError("C3VDDataset is not available in this environment.")
             dataset = C3VDDataset(
+                data_path_root, loader_filenames, height, width,
+                [0], 4, is_train=False, img_ext=img_ext
+            )
+        elif split_key == "hamlyn":
+            dataset = HamlynDataset(
                 data_path_root, loader_filenames, height, width,
                 [0], 4, is_train=False, img_ext=img_ext
             )
@@ -415,7 +435,7 @@ def evaluate_one_root(data_path_root,
 
     mean_errors = np.array(errors).mean(0)
     # abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
-    return mean_errors
+    return mean_errors, len(errors)
 
 def list_corruption_dirs(root):
     """
@@ -434,13 +454,16 @@ def list_corruption_dirs(root):
             if os.path.isdir(os.path.join(root, d))]
 
 def main():
-    parser = argparse.ArgumentParser("Evaluate EndoVIS corruptions (16x5) with AF-SfMLearner weights")
+    parser = argparse.ArgumentParser("Evaluate Hamlyn/EndoVIS/C3VD corruptions with MonoIIT weights")
     parser.add_argument("--corruptions_root", type=str, required=True,
                         help="Raíz de las corrupciones (o una sola corrupción). Ej: /workspace/endovis_corruptions_test")
     parser.add_argument("--load_weights_folder", type=str, required=True,
                         help="Carpeta con encoder.pth y depth.pth")
     parser.add_argument("--splits_dir", type=str, default=os.path.join(os.path.dirname(__file__), "splits"))
     parser.add_argument("--split", type=str, default="endovis", help="Nombre del split (carpeta dentro de splits/)")
+    parser.add_argument("--dataset", type=str, default="",
+                        choices=["", "hamlyn", "endovis", "scared", "c3vd"],
+                        help="Dataset alias compatible with the other repos; defaults to --split when omitted")
     parser.add_argument("--num_layers", type=int, default=18)
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=320)
@@ -459,9 +482,20 @@ def main():
     parser.add_argument("--output_csv", type=str, default="corruptions_summary.csv")
     parser.add_argument("--output_csv_monoiit_corruptions", type=str, default="",
                         help="Alias legacy for --output_csv")
+    parser.add_argument("--run_name", type=str, default="",
+                        help="Optional run subdirectory, compatible with Monodepth2/AF commands")
+    parser.add_argument("--output_dir", type=str, default="",
+                        help="Optional output directory, compatible with Monodepth2/AF commands")
+    parser.add_argument("--summary_filename", type=str, default="",
+                        help="Optional summary CSV filename when --output_dir is used")
+    parser.add_argument("--per_corruption_filename", type=str, default="",
+                        help="Optional per-corruption average CSV filename")
+    parser.add_argument("--global_avg_filename", type=str, default="",
+                        help="Optional global-average CSV filename")
     parser.add_argument("--strict", action="store_true",
                         help="Modo estricto: exige que todas las entradas del split existan en cada severidad.")
     args = parser.parse_args()
+    args.dataset = (args.dataset or args.split).lower()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     cv2.setNumThreads(0)
@@ -488,6 +522,15 @@ def main():
 
     if args.output_csv_monoiit_corruptions:
         args.output_csv = args.output_csv_monoiit_corruptions
+
+    run_output_dir = ""
+    if args.output_dir:
+        run_output_dir = os.path.join(args.output_dir, args.run_name) if args.run_name else args.output_dir
+        os.makedirs(run_output_dir, exist_ok=True)
+        args.output_csv = os.path.join(
+            run_output_dir,
+            args.summary_filename or os.path.basename(args.output_csv)
+        )
 
     if len(test_files) != len(gt_depths):
         print("[WARN] test_files.txt y gt_depths.npz difieren en longitud. "
@@ -519,17 +562,17 @@ def main():
                             key=lambda s: int(s.split("_")[-1]) if s.split("_")[-1].isdigit() else 9999)
 
         for sev in severities:
-            data_root = resolve_data_root(corr_dir, sev, args.split, test_files)
+            data_root = resolve_data_root(corr_dir, sev, args.dataset, test_files)
             print(f"\n>> {corr_name} / {sev} :: data_path = {data_root}")
             if not os.path.isdir(data_root):
                 print(f"   [WARN] No existe {data_root}, se omite.")
                 continue
 
             try:
-                mean_errors = evaluate_one_root(
+                mean_errors, n_eval = evaluate_one_root(
                     data_path_root=data_root,
                     filenames=test_files,
-                    split_name=args.split,
+                    split_name=args.dataset,
                     gt_depths=gt_depths,
                     encoder=encoder,
                     depth_decoder=depth_decoder,
@@ -546,7 +589,7 @@ def main():
                     device=device
                 )
                 abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 = mean_errors.tolist()
-                rows.append([corr_name, sev, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3])
+                rows.append([corr_name, sev, n_eval, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3])
 
                 print("   Métricas (promedio): "
                       f"abs_rel={abs_rel:.3f} | sq_rel={sq_rel:.3f} | rmse={rmse:.3f} | "
@@ -557,7 +600,7 @@ def main():
 
     # Guardar CSV y pretty print
     if rows:
-        header = ["corruption", "severity", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
+        header = ["corruption", "severity", "n_samples", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
         with open(args.output_csv, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(header)
@@ -570,11 +613,36 @@ def main():
         for r in rows:
             bucket[r[0]].append(r)
 
+        if run_output_dir and args.per_corruption_filename:
+            per_corr_rows = []
+            for corr in sorted(bucket.keys()):
+                vals = np.array([r[3:] for r in bucket[corr]], dtype=np.float64)
+                weights = np.array([max(1, int(r[2])) for r in bucket[corr]], dtype=np.float64)
+                means = np.average(vals, axis=0, weights=weights).tolist()
+                per_corr_rows.append([corr, int(weights.sum())] + means)
+            per_corr_path = os.path.join(run_output_dir, args.per_corruption_filename)
+            with open(per_corr_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["corruption", "total_samples", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"])
+                w.writerows(per_corr_rows)
+            print(f"-> Promedio por corrupcion guardado en: {per_corr_path}")
+
+        if run_output_dir and args.global_avg_filename:
+            all_vals = np.array([r[3:] for r in rows], dtype=np.float64)
+            all_weights = np.array([max(1, int(r[2])) for r in rows], dtype=np.float64)
+            global_means = np.average(all_vals, axis=0, weights=all_weights).tolist()
+            global_path = os.path.join(run_output_dir, args.global_avg_filename)
+            with open(global_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["corruption", "total_samples", "abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"])
+                w.writerow(["global", int(all_weights.sum())] + global_means)
+            print(f"-> Promedio global guardado en: {global_path}")
+
         print("\n======= RESUMEN (por corrupción) =======")
         for corr in sorted(bucket.keys()):
             print(f"\n{corr}")
             print("severity | abs_rel |  sq_rel |  rmse  | rmse_log |   a1   |   a2   |   a3")
-            for _, sev, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 in sorted(
+            for _, sev, n_eval, abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3 in sorted(
                 bucket[corr], key=lambda x: int(x[1].split('_')[-1]) if x[1].split('_')[-1].isdigit() else 9999
             ):
                 print(f"{sev:>9} | {abs_rel:7.3f} | {sq_rel:7.3f} | {rmse:7.3f} |  {rmse_log:7.3f} | "
