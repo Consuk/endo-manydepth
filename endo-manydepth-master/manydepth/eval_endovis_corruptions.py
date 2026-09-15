@@ -5,6 +5,8 @@ import argparse
 import csv
 import numpy as np
 import cv2
+from skimage.transform import warp as skimage_warp
+from endoscopycorruptions.corruptions import _distortion_map
 from collections import defaultdict
 from datasets import SCAREDRAWDataset, HamlynDataset
 try:
@@ -32,6 +34,41 @@ DEFAULT_MIN_DEPTH = 1e-3
 DEFAULT_MAX_DEPTH = 150.0
 C3VD_DEFAULT_MIN_DEPTH = 0.1
 C3VD_DEFAULT_MAX_DEPTH = 100.0
+
+LENS_DISTORTION_STRENGTH = {
+    "severity_1": 0.01,
+    "severity_2": 0.02,
+    "severity_3": 0.03,
+    "severity_4": 0.04,
+    "severity_5": 0.05,
+}
+
+
+def align_gt_for_lens_distortion(gt_depth, data_path_root):
+    """Apply the RGB lens-distortion map to GT using nearest-neighbor sampling."""
+    path_parts = os.path.normpath(data_path_root).split(os.sep)
+    if "lens_distortion" not in path_parts:
+        return gt_depth
+
+    severity_name = next(
+        (part for part in path_parts if part in LENS_DISTORTION_STRENGTH),
+        None,
+    )
+    if severity_name is None:
+        raise ValueError(f"Cannot infer lens-distortion severity from {data_path_root}")
+
+    gt_depth = np.asarray(gt_depth, dtype=np.float32)
+    severity = LENS_DISTORTION_STRENGTH[severity_name]
+    aligned = skimage_warp(
+        gt_depth,
+        inverse_map=lambda coords: _distortion_map(coords, severity, gt_depth.shape),
+        order=0,
+        mode="constant",
+        cval=0.0,
+        clip=False,
+        preserve_range=True,
+    )
+    return aligned.astype(np.float32, copy=False)
 
 def _to_numeric_array(x, dtype=np.float32):
     arr = np.asarray(x)
@@ -398,6 +435,7 @@ def evaluate_one_root(data_path_root,
     errors, ratios = [], []
     for i in range(pred_disps.shape[0]):
         gt_depth = _to_numeric_array(sel_gt[i], dtype=np.float32)
+        gt_depth = align_gt_for_lens_distortion(gt_depth, data_path_root)
         gt_h, gt_w = gt_depth.shape[:2]
 
         pred_disp = _to_numeric_array(pred_disps[i], dtype=np.float32)
