@@ -3,6 +3,7 @@ from __future__ import absolute_import, division, print_function
 import os
 import argparse
 import csv
+import json
 import numpy as np
 import cv2
 from skimage.transform import warp as skimage_warp
@@ -100,8 +101,43 @@ def compute_errors(gt, pred):
     sq_rel = np.mean(((gt - pred) ** 2) / gt)
     return abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3
 
-def load_model(load_weights_folder, num_layers, device):
-    """Carga encoder.pth y depth.pth una sola vez."""
+def _compatible_state(model, checkpoint):
+    model_state = model.state_dict()
+    compatible = {
+        key: value for key, value in checkpoint.items()
+        if key in model_state
+        and hasattr(value, "shape")
+        and value.shape == model_state[key].shape
+    }
+    return model_state, compatible
+
+
+def _infer_encoder_type(load_weights_folder, requested):
+    if requested != "auto":
+        return requested
+
+    for path in (
+        os.path.join(load_weights_folder, "opt.json"),
+        os.path.join(os.path.dirname(load_weights_folder), "opt.json"),
+    ):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r") as handle:
+                config = json.load(handle)
+            backbone = str(config.get("backbone", "")).lower()
+            if backbone == "resnet":
+                return "resnet"
+            if backbone in ("mpvit", "monovit"):
+                return "monovit"
+        except (OSError, ValueError):
+            pass
+
+    return "monovit"
+
+
+def load_model(load_weights_folder, num_layers, device, encoder_type="auto"):
+    """Load the architecture recorded with the saved checkpoint."""
     encoder_path = os.path.join(load_weights_folder, "encoder.pth")
     decoder_path = os.path.join(load_weights_folder, "depth.pth")
 
@@ -110,14 +146,35 @@ def load_model(load_weights_folder, num_layers, device):
     if not os.path.isfile(encoder_path) or not os.path.isfile(decoder_path):
         raise FileNotFoundError("Missing encoder.pth or depth.pth in weights folder")
 
-    encoder = networks.mpvit_small()
-    encoder.num_ch_enc = [64, 128, 216, 288, 288]
-    depth_decoder = networks.DepthDecoderT()
-
     encoder_dict = torch.load(encoder_path, map_location=device)
-    model_dict = encoder.state_dict()
-    encoder.load_state_dict({k: v for k, v in encoder_dict.items() if k in model_dict})
-    depth_decoder.load_state_dict(torch.load(decoder_path, map_location=device))
+    selected_type = _infer_encoder_type(load_weights_folder, encoder_type)
+    if selected_type == "resnet":
+        encoder = networks.ResnetEncoder(num_layers, False)
+        depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(4))
+    else:
+        encoder = networks.mpvit_small()
+        encoder.num_ch_enc = [64, 128, 216, 288, 288]
+        depth_decoder = networks.DepthDecoderT()
+
+    encoder_state, compatible_encoder = _compatible_state(encoder, encoder_dict)
+    if len(compatible_encoder) < 0.9 * len(encoder_state):
+        raise RuntimeError(
+            f"El checkpoint no coincide con el encoder {selected_type}: "
+            f"{len(compatible_encoder)}/{len(encoder_state)} tensores compatibles"
+        )
+    encoder_state.update(compatible_encoder)
+    encoder.load_state_dict(encoder_state)
+
+    decoder_dict = torch.load(decoder_path, map_location=device)
+    decoder_state, compatible_decoder = _compatible_state(depth_decoder, decoder_dict)
+    if len(compatible_decoder) < 0.9 * len(decoder_state):
+        raise RuntimeError(
+            f"El checkpoint no coincide con el decodificador del modelo {selected_type}: "
+            f"{len(compatible_decoder)}/{len(decoder_state)} tensores compatibles"
+        )
+    decoder_state.update(compatible_decoder)
+    depth_decoder.load_state_dict(decoder_state)
+    print(f"-> Arquitectura seleccionada: {selected_type}")
 
     encoder.to(device).eval()
     depth_decoder.to(device).eval()
@@ -503,6 +560,9 @@ def main():
                         choices=["", "hamlyn", "endovis", "scared", "c3vd"],
                         help="Dataset alias compatible with the other repos; defaults to --split when omitted")
     parser.add_argument("--num_layers", type=int, default=18)
+    parser.add_argument("--encoder_type", type=str, default="auto",
+                        choices=["auto", "resnet", "monovit"],
+                        help="Arquitectura del checkpoint; auto lee backbone de opt.json")
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -583,7 +643,12 @@ def main():
 
     # Cargar modelo (una sola vez)
     print("-> Cargando pesos:", args.load_weights_folder)
-    encoder, depth_decoder = load_model(args.load_weights_folder, args.num_layers, device)
+    encoder, depth_decoder = load_model(
+        args.load_weights_folder,
+        args.num_layers,
+        device,
+        encoder_type=args.encoder_type,
+    )
 
     # Detectar corrupciones a evaluar
     corr_dirs = list_corruption_dirs(args.corruptions_root)
