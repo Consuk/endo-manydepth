@@ -13,7 +13,8 @@ from layers import ConvBlock, Conv3x3, upsample
 
 
 class DepthDecoder(nn.Module):
-    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=1, use_skips=True):
+    def __init__(self, num_ch_enc, scales=range(4), num_output_channels=1,
+                 use_skips=True, num_ch_dec=None):
         super(DepthDecoder, self).__init__()
 
         self.num_output_channels = num_output_channels
@@ -22,7 +23,13 @@ class DepthDecoder(nn.Module):
         self.scales = scales
 
         self.num_ch_enc = num_ch_enc
-        self.num_ch_dec = np.array([64, 128, 216, 288, 288])
+        self.num_ch_dec = np.array(
+            [64, 128, 216, 288, 288] if num_ch_dec is None else num_ch_dec
+        )
+        if len(self.num_ch_dec) != 5:
+            raise ValueError(
+                "DepthDecoder expects exactly five decoder channel values"
+            )
 
         # decoder
         self.convs = OrderedDict()

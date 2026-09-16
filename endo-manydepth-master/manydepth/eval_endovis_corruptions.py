@@ -150,11 +150,25 @@ def load_model(load_weights_folder, num_layers, device, encoder_type="auto"):
     selected_type = _infer_encoder_type(load_weights_folder, encoder_type)
     if selected_type == "resnet":
         encoder = networks.ResnetEncoder(num_layers, False)
-        depth_decoder = networks.DepthDecoder(encoder.num_ch_enc, scales=range(4))
+        decoder_candidates = [
+            (
+                "legacy",
+                networks.DepthDecoder(
+                    encoder.num_ch_enc,
+                    scales=range(4),
+                    num_ch_dec=[16, 32, 64, 128, 256],
+                ),
+            ),
+            (
+                "expanded",
+                networks.DepthDecoder(encoder.num_ch_enc, scales=range(4)),
+            ),
+        ]
     else:
         encoder = networks.mpvit_small()
         encoder.num_ch_enc = [64, 128, 216, 288, 288]
         depth_decoder = networks.DepthDecoderT()
+        decoder_candidates = [("transformer", depth_decoder)]
 
     encoder_state, compatible_encoder = _compatible_state(encoder, encoder_dict)
     if len(compatible_encoder) < 0.9 * len(encoder_state):
@@ -166,15 +180,25 @@ def load_model(load_weights_folder, num_layers, device, encoder_type="auto"):
     encoder.load_state_dict(encoder_state)
 
     decoder_dict = torch.load(decoder_path, map_location=device)
-    decoder_state, compatible_decoder = _compatible_state(depth_decoder, decoder_dict)
+    decoder_matches = []
+    for decoder_name, candidate in decoder_candidates:
+        candidate_state, compatible = _compatible_state(candidate, decoder_dict)
+        decoder_matches.append(
+            (len(compatible), len(candidate_state), decoder_name,
+             candidate, candidate_state, compatible)
+        )
+    (matched, total, decoder_name, depth_decoder,
+     decoder_state, compatible_decoder) = max(
+        decoder_matches, key=lambda item: item[0] / max(item[1], 1)
+    )
     if len(compatible_decoder) < 0.9 * len(decoder_state):
         raise RuntimeError(
             f"El checkpoint no coincide con el decodificador del modelo {selected_type}: "
-            f"{len(compatible_decoder)}/{len(decoder_state)} tensores compatibles"
+            f"{matched}/{total} tensores compatibles"
         )
     decoder_state.update(compatible_decoder)
     depth_decoder.load_state_dict(decoder_state)
-    print(f"-> Arquitectura seleccionada: {selected_type}")
+    print(f"-> Arquitectura seleccionada: {selected_type}, decoder={decoder_name}")
 
     encoder.to(device).eval()
     depth_decoder.to(device).eval()
